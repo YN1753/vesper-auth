@@ -1,0 +1,104 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>初始化管理员 - Vesper Auth</title>
+  <link rel="stylesheet" href="/static/css/vesper.css">
+</head>
+<body>
+  <main class="auth-viewport">
+    <section class="glass-card auth-card">
+      <div class="brand-header">
+        <div class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-4z"/>
+            <circle cx="12" cy="11" r="2.2"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Vesper Auth 初始化</h1>
+          <p class="brand-sub">{{.IssuerHost}}</p>
+        </div>
+      </div>
+
+      <p class="section-lead">首次启动引导：创建唯一的管理员账号。初始化完成后，公开注册将永久关闭。</p>
+
+      <div id="setup-alert" class="alert alert-error hidden" role="alert"></div>
+
+      <form id="setup-form" autocomplete="on">
+        <div class="field">
+          <label for="username">管理员用户名</label>
+          <input id="username" name="username" class="input" type="text" value="{{.DefaultUser}}" required autocomplete="username">
+        </div>
+        <div class="field">
+          <label for="email">管理员邮箱</label>
+          <input id="email" name="email" class="input" type="email" value="{{.DefaultEmail}}" required autocomplete="email">
+        </div>
+        <div class="field">
+          <label for="display_name">显示名称</label>
+          <input id="display_name" name="display_name" class="input" type="text" value="{{.DefaultUser}}" required>
+        </div>
+        <div class="field">
+          <label for="password">主密码（至少 10 位）</label>
+          <input id="password" name="password" class="input" type="password" minlength="10" required autocomplete="new-password">
+        </div>
+        <div class="field">
+          <label for="password_confirm">确认主密码</label>
+          <input id="password_confirm" name="password_confirm" class="input" type="password" minlength="10" required autocomplete="new-password">
+        </div>
+        <button id="setup-submit" class="btn btn-primary btn-block" type="submit">创建管理员并进入控制台</button>
+      </form>
+    </section>
+  </main>
+
+  <script>
+    (function () {
+      const form = document.getElementById("setup-form");
+      const alertBox = document.getElementById("setup-alert");
+      const submitBtn = document.getElementById("setup-submit");
+
+      function showError(msg) {
+        alertBox.textContent = msg;
+        alertBox.classList.remove("hidden");
+      }
+
+      form.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        alertBox.classList.add("hidden");
+
+        const password = document.getElementById("password").value;
+        const confirm = document.getElementById("password_confirm").value;
+        if (password !== confirm) {
+          showError("两次输入的主密码不一致");
+          return;
+        }
+
+        submitBtn.disabled = true;
+        submitBtn.textContent = "正在初始化...";
+        try {
+          const resp = await fetch("/api/auth/setup", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              username: document.getElementById("username").value.trim(),
+              email: document.getElementById("email").value.trim(),
+              display_name: document.getElementById("display_name").value.trim(),
+              password: password
+            })
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.error || "初始化失败");
+          }
+          window.location.href = data.redirect || "/";
+        } catch (err) {
+          showError(err.message);
+          submitBtn.disabled = false;
+          submitBtn.textContent = "创建管理员并进入控制台";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

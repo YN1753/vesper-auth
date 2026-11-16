@@ -1,0 +1,21 @@
+# Binaries & build artifacts
+/vesper-auth
+/vesper-auth-*
+/dist/
+/build/
+
+# Local runtime data
+/data/
+*.db
+*.db-wal
+*.db-shm
+
+# Local env files
+.env
+*.env
+!deploy/*.env.example
+
+# OS / IDE
+.DS_Store
+.idea/
+.vscode/

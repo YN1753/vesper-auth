@@ -1,0 +1,164 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>登录 - Vesper Auth</title>
+  <link rel="stylesheet" href="/static/css/vesper.css">
+</head>
+<body>
+  <main class="auth-viewport">
+    <section class="glass-card auth-card">
+      <div class="brand-header">
+        <div class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-4z"/>
+            <circle cx="12" cy="11" r="2.2"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Vesper Auth</h1>
+          <p class="brand-sub">{{.IssuerHost}}</p>
+        </div>
+      </div>
+
+      {{if .PendingClient}}
+      <div class="alert alert-info">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <circle cx="12" cy="12" r="9"/>
+          <path d="M12 16v-4"/>
+          <path d="M12 8h.01"/>
+        </svg>
+        <div>正在登录以授权访问 <strong>{{.PendingClient}}</strong></div>
+      </div>
+      {{end}}
+
+      {{if .LoggedOut}}
+      <div class="alert alert-success">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M20 6L9 17l-5-5"/>
+        </svg>
+        <div>已安全退出当前会话</div>
+      </div>
+      {{end}}
+
+      <div id="login-alert" class="alert alert-error hidden" role="alert"></div>
+
+      <button id="passkey-btn" class="btn btn-primary btn-block" type="button">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.9" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/>
+          <path d="M14 13.12c0 2.38 0 6.38-1 8.88"/>
+          <path d="M17.29 21.02c.12-.6.43-2.3.5-3.02"/>
+          <path d="M2 12a10 10 0 0 1 18-6"/>
+          <path d="M2 16h.01"/>
+          <path d="M21.8 16c.2-2 .131-5.354 0-6"/>
+          <path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/>
+          <path d="M8.65 22c.21-.66.45-1.32.57-2"/>
+          <path d="M9 6.8a6 6 0 0 1 9 5.2v2"/>
+        </svg>
+        <span>使用 Passkey 登录（指纹 / 面容）</span>
+      </button>
+
+      <div class="divider-toggle">
+        <button id="toggle-password-btn" class="btn btn-secondary btn-block" type="button" aria-expanded="false">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <rect x="3" y="11" width="18" height="11" rx="2"/>
+            <path d="M7 11V7a5 5 0 0 1 10 0v4"/>
+          </svg>
+          <span>使用主密码登录</span>
+        </button>
+
+        <form id="password-form" class="hidden" style="margin-top: 16px;" autocomplete="on">
+          <div class="field">
+            <label for="identifier">用户名或邮箱</label>
+            <input id="identifier" name="identifier" class="input" type="text" required autocomplete="username">
+          </div>
+          <div class="field">
+            <label for="password">主密码</label>
+            <input id="password" name="password" class="input" type="password" required autocomplete="current-password">
+          </div>
+          <button id="password-submit" class="btn btn-primary btn-block" type="submit">验证主密码并登录</button>
+        </form>
+      </div>
+    </section>
+  </main>
+
+  <script src="/static/js/webauthn.js"></script>
+  <script>
+    (function () {
+      const reqId = {{.ReqIDJSON}};
+      const nextUrl = {{.NextURLJSON}};
+      const alertBox = document.getElementById("login-alert");
+      const passkeyBtn = document.getElementById("passkey-btn");
+      const toggleBtn = document.getElementById("toggle-password-btn");
+      const pwdForm = document.getElementById("password-form");
+      const pwdSubmit = document.getElementById("password-submit");
+
+      function showError(msg) {
+        alertBox.textContent = msg;
+        alertBox.classList.remove("hidden");
+      }
+
+      function redirectAfterLogin(data) {
+        if (data && data.redirect) {
+          window.location.href = data.redirect;
+          return;
+        }
+        if (reqId) {
+          window.location.href = "/oauth2/authorize?req=" + encodeURIComponent(reqId);
+          return;
+        }
+        window.location.href = nextUrl || "/";
+      }
+
+      toggleBtn.addEventListener("click", function () {
+        const isHidden = pwdForm.classList.toggle("hidden");
+        toggleBtn.setAttribute("aria-expanded", String(!isHidden));
+        if (!isHidden) {
+          document.getElementById("identifier").focus();
+        }
+      });
+
+      passkeyBtn.addEventListener("click", async function () {
+        alertBox.classList.add("hidden");
+        passkeyBtn.disabled = true;
+        try {
+          const data = await window.VesperWebAuthn.login(reqId);
+          redirectAfterLogin(data);
+        } catch (err) {
+          showError(err.message || "Passkey 登录失败");
+          passkeyBtn.disabled = false;
+        }
+      });
+
+      pwdForm.addEventListener("submit", async function (e) {
+        e.preventDefault();
+        alertBox.classList.add("hidden");
+        pwdSubmit.disabled = true;
+        pwdSubmit.textContent = "正在验证...";
+        try {
+          const resp = await fetch("/api/auth/login", {
+            method: "POST",
+            headers: { "Content-Type": "application/json" },
+            body: JSON.stringify({
+              identifier: document.getElementById("identifier").value.trim(),
+              password: document.getElementById("password").value,
+              req: reqId,
+              next: nextUrl
+            })
+          });
+          const data = await resp.json();
+          if (!resp.ok) {
+            throw new Error(data.error || "登录失败");
+          }
+          redirectAfterLogin(data);
+        } catch (err) {
+          showError(err.message);
+          pwdSubmit.disabled = false;
+          pwdSubmit.textContent = "验证主密码并登录";
+        }
+      });
+    })();
+  </script>
+</body>
+</html>

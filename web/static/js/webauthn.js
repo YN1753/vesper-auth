@@ -1,0 +1,156 @@
+(function (global) {
+  "use strict";
+
+  function base64urlToBytes(str) {
+    const pad = "=".repeat((4 - (str.length % 4)) % 4);
+    const base64 = (str + pad).replace(/-/g, "+").replace(/_/g, "/");
+    const raw = atob(base64);
+    const bytes = new Uint8Array(raw.length);
+    for (let i = 0; i < raw.length; i++) {
+      bytes[i] = raw.charCodeAt(i);
+    }
+    return bytes;
+  }
+
+  function bytesToBase64url(buffer) {
+    const bytes = buffer instanceof Uint8Array ? buffer : new Uint8Array(buffer);
+    let bin = "";
+    for (let i = 0; i < bytes.byteLength; i++) {
+      bin += String.fromCharCode(bytes[i]);
+    }
+    return btoa(bin).replace(/\+/g, "-").replace(/\//g, "_").replace(/=+$/, "");
+  }
+
+  function ensureSupported() {
+    if (!window.PublicKeyCredential || !navigator.credentials) {
+      throw new Error("当前浏览器环境不支持 WebAuthn Passkey，请使用 HTTPS 或更换现代浏览器");
+    }
+  }
+
+  async function passkeyLogin(reqId) {
+    ensureSupported();
+    const beginResp = await fetch("/api/auth/passkey/login/begin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ req: reqId || "" }),
+    });
+    const beginData = await beginResp.json();
+    if (!beginResp.ok) {
+      throw new Error(beginData.error || "无法发起 Passkey 登录请求");
+    }
+
+    const pk = beginData.options.publicKey;
+    pk.challenge = base64urlToBytes(pk.challenge);
+    if (Array.isArray(pk.allowCredentials)) {
+      pk.allowCredentials = pk.allowCredentials.map(function (item) {
+        return Object.assign({}, item, { id: base64urlToBytes(item.id) });
+      });
+    }
+
+    const cred = await navigator.credentials.get({ publicKey: pk });
+    if (!cred) {
+      throw new Error("未获取到 Passkey 凭证");
+    }
+
+    const payload = {
+      id: cred.id,
+      rawId: bytesToBase64url(cred.rawId),
+      type: cred.type,
+      authenticatorAttachment: cred.authenticatorAttachment || undefined,
+      response: {
+        authenticatorData: bytesToBase64url(cred.response.authenticatorData),
+        clientDataJSON: bytesToBase64url(cred.response.clientDataJSON),
+        signature: bytesToBase64url(cred.response.signature),
+        userHandle: cred.response.userHandle
+          ? bytesToBase64url(cred.response.userHandle)
+          : undefined,
+      },
+    };
+
+    const finishUrl =
+      "/api/auth/passkey/login/finish?ceremony_id=" +
+      encodeURIComponent(beginData.ceremony_id) +
+      (reqId ? "&req=" + encodeURIComponent(reqId) : "");
+
+    const finishResp = await fetch(finishUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Ceremony-ID": beginData.ceremony_id,
+      },
+      body: JSON.stringify(payload),
+    });
+    const finishData = await finishResp.json();
+    if (!finishResp.ok) {
+      throw new Error(finishData.error || "Passkey 验证失败");
+    }
+    return finishData;
+  }
+
+  async function passkeyRegister(deviceName) {
+    ensureSupported();
+    const beginResp = await fetch("/api/admin/passkeys/register/begin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ name: deviceName }),
+    });
+    const beginData = await beginResp.json();
+    if (!beginResp.ok) {
+      throw new Error(beginData.error || "无法发起 Passkey 绑定");
+    }
+
+    const pk = beginData.options.publicKey;
+    pk.challenge = base64urlToBytes(pk.challenge);
+    pk.user.id = base64urlToBytes(pk.user.id);
+    if (Array.isArray(pk.excludeCredentials)) {
+      pk.excludeCredentials = pk.excludeCredentials.map(function (item) {
+        return Object.assign({}, item, { id: base64urlToBytes(item.id) });
+      });
+    }
+
+    const cred = await navigator.credentials.create({ publicKey: pk });
+    if (!cred) {
+      throw new Error("Passkey 创建已取消");
+    }
+
+    const transports =
+      typeof cred.response.getTransports === "function"
+        ? cred.response.getTransports()
+        : undefined;
+
+    const payload = {
+      id: cred.id,
+      rawId: bytesToBase64url(cred.rawId),
+      type: cred.type,
+      authenticatorAttachment: cred.authenticatorAttachment || undefined,
+      response: {
+        attestationObject: bytesToBase64url(cred.response.attestationObject),
+        clientDataJSON: bytesToBase64url(cred.response.clientDataJSON),
+        transports: transports,
+      },
+    };
+
+    const finishResp = await fetch(
+      "/api/admin/passkeys/register/finish?ceremony_id=" +
+        encodeURIComponent(beginData.ceremony_id),
+      {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-Ceremony-ID": beginData.ceremony_id,
+        },
+        body: JSON.stringify(payload),
+      }
+    );
+    const finishData = await finishResp.json();
+    if (!finishResp.ok) {
+      throw new Error(finishData.error || "Passkey 绑定验证失败");
+    }
+    return finishData;
+  }
+
+  global.VesperWebAuthn = {
+    login: passkeyLogin,
+    register: passkeyRegister,
+  };
+})(window);

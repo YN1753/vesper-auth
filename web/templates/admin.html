@@ -1,0 +1,292 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>控制台 - Vesper Auth</title>
+  <link rel="stylesheet" href="/static/css/vesper.css">
+</head>
+<body>
+  <div class="console-shell">
+    <header class="glass-card topbar">
+      <div class="brand-header" style="margin-bottom: 0;">
+        <div class="brand-mark" aria-hidden="true">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-4z"/>
+            <circle cx="12" cy="11" r="2.2"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">Vesper Auth</h1>
+          <p class="brand-sub" id="issuer-label">{{.Issuer}}</p>
+        </div>
+      </div>
+
+      <div class="topbar-meta">
+        <span class="badge badge-gold" id="admin-badge">{{.Username}} ({{.Email}})</span>
+        <button id="logout-btn" class="btn btn-secondary btn-sm" type="button">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/>
+            <polyline points="16 17 21 12 16 7"/>
+            <line x1="21" y1="12" x2="9" y2="12"/>
+          </svg>
+          <span>退出登录</span>
+        </button>
+      </div>
+    </header>
+
+    <nav class="glass-card nav-tabs" aria-label="控制台导航">
+      <button class="nav-tab active" data-tab="clients" type="button">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="3" y="3" width="7" height="7" rx="1.5"/>
+          <rect x="14" y="3" width="7" height="7" rx="1.5"/>
+          <rect x="14" y="14" width="7" height="7" rx="1.5"/>
+          <rect x="3" y="14" width="7" height="7" rx="1.5"/>
+        </svg>
+        <span>应用接入 (OAuth2)</span>
+      </button>
+      <button class="nav-tab" data-tab="security" type="button">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M12 10a2 2 0 0 0-2 2c0 1.02-.1 2.51-.26 4"/>
+          <path d="M14 13.12c0 2.38 0 6.38-1 8.88"/>
+          <path d="M2 12a10 10 0 0 1 18-6"/>
+          <path d="M5 19.5C5.5 18 6 15 6 12a6 6 0 0 1 .34-2"/>
+          <path d="M9 6.8a6 6 0 0 1 9 5.2v2"/>
+        </svg>
+        <span>Passkey 与账号安全</span>
+      </button>
+      <button class="nav-tab" data-tab="sessions" type="button">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <rect x="2" y="4" width="20" height="13" rx="2"/>
+          <path d="M8 21h8"/>
+          <path d="M12 17v4"/>
+        </svg>
+        <span>活跃会话</span>
+      </button>
+      <button class="nav-tab" data-tab="audit" type="button">
+        <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+          <path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/>
+          <polyline points="14 2 14 8 20 8"/>
+          <line x1="8" y1="13" x2="16" y2="13"/>
+          <line x1="8" y1="17" x2="13" y2="17"/>
+        </svg>
+        <span>安全审计流水</span>
+      </button>
+    </nav>
+
+    <div id="global-secret-banner" class="alert alert-info hidden" style="justify-content: space-between; align-items: center;">
+      <div>
+        <strong id="secret-banner-title">新客户端密钥已生成（仅展示一次，请立即保存）</strong>
+        <div class="mono" id="secret-banner-value" style="margin-top: 4px;"></div>
+      </div>
+      <div class="item-actions">
+        <button id="copy-banner-secret" class="btn btn-primary btn-sm" type="button">复制密钥</button>
+        <button id="close-banner-secret" class="btn btn-secondary btn-sm" type="button">关闭</button>
+      </div>
+    </div>
+
+    <!-- Tab: OAuth2 Clients -->
+    <section id="tab-clients" class="glass-card panel">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">OAuth 2.0 / OIDC 应用列表</h2>
+          <p class="panel-sub">管理个人云端基建矩阵的接入客户端，支持静默授权与 PKCE</p>
+        </div>
+        <button id="new-client-btn" class="btn btn-primary" type="button">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
+            <line x1="12" y1="5" x2="12" y2="19"/>
+            <line x1="5" y1="12" x2="19" y2="12"/>
+          </svg>
+          <span>新增应用</span>
+        </button>
+      </div>
+
+      <div class="preset-bar">
+        <span class="preset-label">快速预设：</span>
+        <button class="btn btn-secondary btn-sm preset-btn" data-preset="nezha" type="button">哪吒监控 (dash)</button>
+        <button class="btn btn-secondary btn-sm preset-btn" data-preset="alist" type="button">Alist (pan)</button>
+        <button class="btn btn-secondary btn-sm preset-btn" data-preset="bothub_web" type="button">BotHub 2.0 Web</button>
+        <button class="btn btn-secondary btn-sm preset-btn" data-preset="bothub_android" type="button">BotHub Android (PKCE)</button>
+      </div>
+
+      <div id="clients-list" class="list-stack"></div>
+    </section>
+
+    <!-- Tab: Passkey & Security -->
+    <section id="tab-security" class="hidden">
+      <div class="grid-2">
+        <div class="glass-card panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">绑定设备 Passkey</h2>
+              <p class="panel-sub">支持 Mac Touch ID、手机面容/指纹与硬件密钥</p>
+            </div>
+          </div>
+
+          <form id="register-passkey-form">
+            <div class="field">
+              <label for="passkey-device-name">设备备注名称</label>
+              <input id="passkey-device-name" class="input" type="text" placeholder="例如：MacBook Pro / Android Phone" required>
+            </div>
+            <button id="register-passkey-btn" class="btn btn-primary btn-block" type="submit">绑定当前设备 Passkey</button>
+          </form>
+
+          <div style="margin-top: 22px;">
+            <h3 style="margin: 0 0 12px; font-size: 0.95rem; color: var(--text-secondary);">已绑定的 Passkey</h3>
+            <div id="passkeys-list" class="list-stack"></div>
+          </div>
+        </div>
+
+        <div class="glass-card panel">
+          <div class="panel-header">
+            <div>
+              <h2 class="panel-title">管理员主密码与资料</h2>
+              <p class="panel-sub">主密码仅作无 Passkey 环境下的兜底登录凭证</p>
+            </div>
+          </div>
+
+          <form id="profile-form" style="margin-bottom: 24px;">
+            <div class="field">
+              <label for="profile-email">管理员邮箱</label>
+              <input id="profile-email" class="input" type="email" value="{{.Email}}" required>
+            </div>
+            <div class="field">
+              <label for="profile-display">显示名称</label>
+              <input id="profile-display" class="input" type="text" value="{{.DisplayName}}" required>
+            </div>
+            <button class="btn btn-secondary btn-block" type="submit">保存资料</button>
+          </form>
+
+          <form id="password-change-form">
+            <div class="field">
+              <label for="current-password">当前主密码</label>
+              <input id="current-password" class="input" type="password" required autocomplete="current-password">
+            </div>
+            <div class="field">
+              <label for="new-password">新主密码（至少 10 位）</label>
+              <input id="new-password" class="input" type="password" minlength="10" required autocomplete="new-password">
+            </div>
+            <div class="field">
+              <label for="confirm-new-password">确认新主密码</label>
+              <input id="confirm-new-password" class="input" type="password" minlength="10" required autocomplete="new-password">
+            </div>
+            <button class="btn btn-primary btn-block" type="submit">更新主密码</button>
+          </form>
+        </div>
+      </div>
+    </section>
+
+    <!-- Tab: Sessions -->
+    <section id="tab-sessions" class="glass-card panel hidden">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">活跃登录会话</h2>
+          <p class="panel-sub">查看所有未过期浏览器会话并支持随时强制下线</p>
+        </div>
+        <button id="revoke-others-btn" class="btn btn-danger btn-sm" type="button">踢下线其他所有会话</button>
+      </div>
+      <div id="sessions-list" class="list-stack"></div>
+    </section>
+
+    <!-- Tab: Audit Logs -->
+    <section id="tab-audit" class="glass-card panel hidden">
+      <div class="panel-header">
+        <div>
+          <h2 class="panel-title">安全审计流水</h2>
+          <p class="panel-sub">完整记录登录验证、Passkey 变更、OAuth 授权与令牌签发事件</p>
+        </div>
+        <button id="refresh-audit-btn" class="btn btn-secondary btn-sm" type="button">刷新日志</button>
+      </div>
+      <div class="table-wrap">
+        <table class="audit-table">
+          <thead>
+            <tr>
+              <th>时间</th>
+              <th>状态</th>
+              <th>事件类型</th>
+              <th>主体</th>
+              <th>来源 IP</th>
+              <th>目标 / 详情</th>
+            </tr>
+          </thead>
+          <tbody id="audit-tbody"></tbody>
+        </table>
+      </div>
+      <div class="pagination">
+        <span id="audit-summary" class="field-hint" style="margin: 0;"></span>
+        <div class="item-actions">
+          <button id="audit-prev-btn" class="btn btn-secondary btn-sm" type="button">上一页</button>
+          <button id="audit-next-btn" class="btn btn-secondary btn-sm" type="button">下一页</button>
+        </div>
+      </div>
+    </section>
+  </div>
+
+  <!-- Modal: Create / Edit Client -->
+  <div id="client-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <h3 id="client-modal-title" class="panel-title">新增 OAuth2 应用</h3>
+        <button id="client-modal-close" class="btn btn-secondary btn-sm" type="button">关闭</button>
+      </div>
+      <form id="client-form">
+        <input type="hidden" id="client-edit-id">
+        <div class="field">
+          <label for="client-name">应用名称</label>
+          <input id="client-name" class="input" type="text" required placeholder="例如：哪吒监控">
+        </div>
+        <div class="field">
+          <label for="client-desc">备注说明</label>
+          <input id="client-desc" class="input" type="text" placeholder="例如：dash.starryheavens.uk 运维面板">
+        </div>
+        <div class="field">
+          <label for="client-uris">允许回调地址 redirect_uris（每行一条）</label>
+          <textarea id="client-uris" class="textarea" required placeholder="https://dash.starryheavens.uk/oauth2/callback"></textarea>
+        </div>
+        <label class="checkbox-row">
+          <input id="client-trusted" type="checkbox" checked>
+          <span>信任应用（已登录状态下静默完成授权，跳过手动确认页）</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="client-public" type="checkbox">
+          <span>Public 公共客户端（无 client_secret，适用于 Android / 原生 App，强制启用 PKCE）</span>
+        </label>
+        <label class="checkbox-row">
+          <input id="client-pkce" type="checkbox">
+          <span>强制要求 PKCE（S256）</span>
+        </label>
+
+        <div class="btn-row" style="margin-top: 20px;">
+          <button id="client-modal-cancel" class="btn btn-secondary" type="button">取消</button>
+          <button id="client-save-btn" class="btn btn-primary" type="submit">保存应用</button>
+        </div>
+      </form>
+    </div>
+  </div>
+
+  <!-- Modal: Integration Config Guide -->
+  <div id="guide-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card">
+      <div class="modal-header">
+        <div>
+          <h3 id="guide-modal-title" class="panel-title">接入配置参数</h3>
+          <p id="guide-modal-sub" class="panel-sub"></p>
+        </div>
+        <button id="guide-modal-close" class="btn btn-secondary btn-sm" type="button">关闭</button>
+      </div>
+      <div id="guide-body"></div>
+    </div>
+  </div>
+
+  <div id="toast" class="toast hidden" role="status"></div>
+
+  <script>
+    window.VESPER_CONFIG = {
+      issuer: {{.IssuerJSON}},
+      csrfToken: {{.CSRFTokenJSON}}
+    };
+  </script>
+  <script src="/static/js/webauthn.js"></script>
+  <script src="/static/js/admin.js"></script>
+</body>
+</html>

@@ -1,0 +1,28 @@
+[Unit]
+Description=Vesper Auth - Personal OAuth 2.0 / OIDC Identity Provider
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=vesper-auth
+Group=vesper-auth
+WorkingDirectory=/opt/vesper-auth
+ExecStart=/opt/vesper-auth/vesper-auth
+EnvironmentFile=/etc/vesper-auth/vesper-auth.env
+Restart=on-failure
+RestartSec=3s
+
+# Hardening
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/opt/vesper-auth/data
+CapabilityBoundingSet=
+AmbientCapabilities=
+LockPersonality=true
+RestrictRealtime=true
+
+[Install]
+WantedBy=multi-user.target

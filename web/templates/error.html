@@ -1,0 +1,32 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1.0">
+  <title>{{.Title}} - Vesper Auth</title>
+  <link rel="stylesheet" href="/static/css/vesper.css">
+</head>
+<body>
+  <main class="auth-viewport">
+    <section class="glass-card auth-card">
+      <div class="brand-header">
+        <div class="brand-mark" aria-hidden="true" style="color: var(--rose); border-color: rgba(251, 113, 133, 0.36); background: var(--rose-soft);">
+          <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
+            <circle cx="12" cy="12" r="9"/>
+            <path d="M12 8v5"/>
+            <path d="M12 16h.01"/>
+          </svg>
+        </div>
+        <div>
+          <h1 class="brand-title">{{.Title}}</h1>
+          <p class="brand-sub">HTTP {{.Status}}</p>
+        </div>
+      </div>
+
+      <p class="section-lead">{{.Message}}</p>
+
+      <a class="btn btn-secondary btn-block" href="/">返回控制台</a>
+    </section>
+  </main>
+</body>
+</html>
