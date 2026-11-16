@@ -87,11 +87,17 @@
     return finishData;
   }
 
-  async function passkeyRegister(deviceName) {
+  async function passkeyRegister(deviceName, csrfToken) {
     ensureSupported();
+    const csrf =
+      csrfToken ||
+      (global.VESPER_CONFIG && global.VESPER_CONFIG.csrfToken) ||
+      "";
+    const beginHeaders = { "Content-Type": "application/json" };
+    if (csrf) beginHeaders["X-CSRF-Token"] = csrf;
     const beginResp = await fetch("/api/admin/passkeys/register/begin", {
       method: "POST",
-      headers: { "Content-Type": "application/json" },
+      headers: beginHeaders,
       body: JSON.stringify({ name: deviceName }),
     });
     const beginData = await beginResp.json();
@@ -130,15 +136,17 @@
       },
     };
 
+    const finishHeaders = {
+      "Content-Type": "application/json",
+      "X-Ceremony-ID": beginData.ceremony_id,
+    };
+    if (csrf) finishHeaders["X-CSRF-Token"] = csrf;
     const finishResp = await fetch(
       "/api/admin/passkeys/register/finish?ceremony_id=" +
         encodeURIComponent(beginData.ceremony_id),
       {
         method: "POST",
-        headers: {
-          "Content-Type": "application/json",
-          "X-Ceremony-ID": beginData.ceremony_id,
-        },
+        headers: finishHeaders,
         body: JSON.stringify(payload),
       }
     );
