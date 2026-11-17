@@ -302,9 +302,9 @@ func (s *Store) GetAuthRequest(id string) (*AuthRequest, error) {
 	return r, nil
 }
 
-// ClearAuthRequestPrompt updates prompt on an active AuthRequest (e.g. after satisfying prompt=login).
-func (s *Store) ClearAuthRequestPrompt(id, newPrompt string) error {
-	_, err := s.db.Exec(`UPDATE auth_requests SET prompt = ? WHERE id = ?`, newPrompt, id)
+// ClearAuthRequestReauth updates prompt and clears max_age after fresh authentication satisfies re-auth requirements.
+func (s *Store) ClearAuthRequestReauth(id, newPrompt string) error {
+	_, err := s.db.Exec(`UPDATE auth_requests SET prompt = ?, max_age = -1 WHERE id = ?`, newPrompt, id)
 	return err
 }
 

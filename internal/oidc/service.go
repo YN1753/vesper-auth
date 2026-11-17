@@ -128,10 +128,8 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	var req *store.AuthRequest
 	var client *store.OAuthClient
 	var err error
-	fromSavedReq := false
 
 	if reqID := strings.TrimSpace(q.Get("req")); reqID != "" {
-		fromSavedReq = true
 		req, err = s.store.GetAuthRequest(reqID)
 		if err != nil {
 			s.renderErr(w, http.StatusBadRequest, "授权请求无效或已过期", "请返回原应用重新发起登录授权。")
@@ -221,10 +219,10 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	// Check OIDC prompt=login or max_age expiration on initial entry before re-authentication.
+	// Check OIDC prompt=login or max_age expiration.
 	needsReauth := hasPrompt(req.Prompt, "login")
-	if !needsReauth && req.MaxAge >= 0 && !fromSavedReq {
-		if time.Now().Unix()-ses.CreatedAt > req.MaxAge {
+	if !needsReauth && req.MaxAge >= 0 {
+		if req.MaxAge == 0 || time.Now().Unix()-ses.CreatedAt > req.MaxAge {
 			needsReauth = true
 		}
 	}

@@ -137,7 +137,7 @@ func (s *Server) registerRoutes() {
 	s.mux.HandleFunc("GET /{$}", s.handleAdminPage)
 	s.mux.HandleFunc("GET /api/admin/overview", s.withAdmin(false, s.handleAdminOverview))
 	s.mux.HandleFunc("POST /api/admin/profile", s.withAdmin(true, s.handleUpdateProfile))
-	s.mux.HandleFunc("POST /api/admin/password", s.withAdmin(true, s.withSudo(s.handleChangePassword)))
+	s.mux.HandleFunc("POST /api/admin/password", s.withAdmin(true, s.handleChangePassword))
 
 	// Sudo re-authentication endpoints
 	s.mux.HandleFunc("POST /api/admin/sudo/password", s.withAdmin(true, s.handleSudoPassword))

@@ -2,6 +2,7 @@ package store
 
 import (
 	"context"
+	"database/sql"
 	"path/filepath"
 	"sync"
 	"testing"
@@ -116,3 +117,112 @@ func TestParseUserAgentLabel(t *testing.T) {
 		}
 	}
 }
+
+func TestLegacyV010SchemaMigrationPreservesAllData(t *testing.T) {
+	dbPath := filepath.Join(t.TempDir(), "legacy-v010.db")
+
+	// Construct exact v0.1.0 production schema prior to v0.2.0 columns/tables.
+	rawDB, err := sql.Open("sqlite", dbPath)
+	if err != nil {
+		t.Fatalf("sql.Open legacy: %v", err)
+	}
+	legacyDDL := `
+	PRAGMA journal_mode = WAL;
+	CREATE TABLE admin_users (
+		id TEXT PRIMARY KEY, username TEXT NOT NULL UNIQUE, email TEXT NOT NULL,
+		display_name TEXT NOT NULL, password_hash TEXT NOT NULL, webauthn_user_id BLOB NOT NULL,
+		created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+	);
+	CREATE TABLE passkeys (
+		id TEXT PRIMARY KEY, user_id TEXT NOT NULL, credential_id BLOB NOT NULL UNIQUE,
+		name TEXT NOT NULL, credential_json TEXT NOT NULL, aaguid TEXT NOT NULL DEFAULT '',
+		sign_count INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, last_used_at INTEGER NOT NULL DEFAULT 0
+	);
+	CREATE TABLE sessions (
+		id TEXT PRIMARY KEY, token_hash TEXT NOT NULL UNIQUE, user_id TEXT NOT NULL,
+		ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', auth_method TEXT NOT NULL DEFAULT 'password',
+		created_at INTEGER NOT NULL, last_seen_at INTEGER NOT NULL, expires_at INTEGER NOT NULL
+	);
+	CREATE TABLE signing_keys (
+		kid TEXT PRIMARY KEY, algorithm TEXT NOT NULL, private_pem TEXT NOT NULL,
+		active INTEGER NOT NULL DEFAULT 1, created_at INTEGER NOT NULL
+	);
+	CREATE TABLE oauth_clients (
+		id TEXT PRIMARY KEY, name TEXT NOT NULL, description TEXT NOT NULL DEFAULT '',
+		secret_hash TEXT NOT NULL DEFAULT '', redirect_uris TEXT NOT NULL,
+		trusted INTEGER NOT NULL DEFAULT 0, pkce_required INTEGER NOT NULL DEFAULT 0,
+		is_public INTEGER NOT NULL DEFAULT 0, created_at INTEGER NOT NULL, updated_at INTEGER NOT NULL
+	);
+	CREATE TABLE auth_requests (
+		id TEXT PRIMARY KEY, client_id TEXT NOT NULL, redirect_uri TEXT NOT NULL,
+		response_type TEXT NOT NULL, scope TEXT NOT NULL, state TEXT NOT NULL DEFAULT '',
+		nonce TEXT NOT NULL DEFAULT '', code_challenge TEXT NOT NULL DEFAULT '',
+		code_challenge_method TEXT NOT NULL DEFAULT '', expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
+	);
+	CREATE TABLE auth_codes (
+		code_hash TEXT PRIMARY KEY, client_id TEXT NOT NULL, user_id TEXT NOT NULL,
+		redirect_uri TEXT NOT NULL, scope TEXT NOT NULL, nonce TEXT NOT NULL DEFAULT '',
+		code_challenge TEXT NOT NULL DEFAULT '', code_challenge_method TEXT NOT NULL DEFAULT '',
+		auth_time INTEGER NOT NULL, used INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
+	);
+	CREATE TABLE access_tokens (
+		jti TEXT PRIMARY KEY, client_id TEXT NOT NULL, user_id TEXT NOT NULL,
+		scope TEXT NOT NULL, revoked INTEGER NOT NULL DEFAULT 0, expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
+	);
+	CREATE TABLE refresh_tokens (
+		token_hash TEXT PRIMARY KEY, family_id TEXT NOT NULL, client_id TEXT NOT NULL,
+		user_id TEXT NOT NULL, scope TEXT NOT NULL, auth_time INTEGER NOT NULL,
+		rotated INTEGER NOT NULL DEFAULT 0, revoked INTEGER NOT NULL DEFAULT 0,
+		expires_at INTEGER NOT NULL, created_at INTEGER NOT NULL
+	);
+	CREATE TABLE audit_logs (
+		id INTEGER PRIMARY KEY AUTOINCREMENT, event_type TEXT NOT NULL, actor TEXT NOT NULL,
+		ip TEXT NOT NULL DEFAULT '', user_agent TEXT NOT NULL DEFAULT '', target TEXT NOT NULL DEFAULT '',
+		detail TEXT NOT NULL DEFAULT '', status TEXT NOT NULL, created_at INTEGER NOT NULL
+	);
+	`
+	if _, err := rawDB.Exec(legacyDDL); err != nil {
+		t.Fatalf("exec legacy DDL: %v", err)
+	}
+	now := time.Now().Unix()
+	_, err = rawDB.Exec(`INSERT INTO admin_users VALUES ('usr_prod', 'admin', 'admin@starryheavens.uk', 'admin', 'hash', X'01020304', ?, ?)`, now, now)
+	if err != nil {
+		t.Fatalf("seed admin: %v", err)
+	}
+	_, _ = rawDB.Exec(`INSERT INTO passkeys VALUES ('pk_1', 'usr_prod', X'AABB', 'MacBook Pro', '{}', '', 3, ?, ?)`, now, now)
+	_, _ = rawDB.Exec(`INSERT INTO passkeys VALUES ('pk_2', 'usr_prod', X'CCDD', 'Android Phone', '{}', '', 1, ?, ?)`, now, now)
+	for _, id := range []string{"va_1", "va_2", "va_3", "va_4"} {
+		_, _ = rawDB.Exec(`INSERT INTO oauth_clients VALUES (?, ?, '', 'sec', '["https://dash.starryheavens.uk/cb"]', 1, 0, 0, ?, ?)`, id, "App "+id, now, now)
+	}
+	_, _ = rawDB.Exec(`INSERT INTO sessions VALUES ('ses_live', ?, 'usr_prod', '1.2.3.4', 'Mozilla/5.0 (Macintosh)', 'passkey', ?, ?, ?)`,
+		HashToken("live_raw_token"), now, now, now+3600)
+	_ = rawDB.Close()
+
+	// Open with v0.2.0 Store and verify lossless upgrade.
+	st, err := Open(dbPath)
+	if err != nil {
+		t.Fatalf("Open upgraded store: %v", err)
+	}
+	defer st.Close()
+
+	u, err := st.GetAdmin()
+	if err != nil || u.ID != "usr_prod" {
+		t.Fatalf("admin lost after migration: %v %+v", err, u)
+	}
+	pks, err := st.ListPasskeys(u.ID)
+	if err != nil || len(pks) != 2 {
+		t.Fatalf("passkeys lost after migration: %v len=%d", err, len(pks))
+	}
+	clients, err := st.ListOAuthClients()
+	if err != nil || len(clients) != 4 {
+		t.Fatalf("oauth_clients lost after migration: %v len=%d", err, len(clients))
+	}
+	ses, err := st.GetSessionByToken("live_raw_token")
+	if err != nil || ses.ID != "ses_live" || ses.ElevatedAt != 0 {
+		t.Fatalf("existing session broken after migration: %v %+v", err, ses)
+	}
+	if secret, err := st.GetOrCreateCSRFSecret(); err != nil || len(secret) != 32 {
+		t.Fatalf("GetOrCreateCSRFSecret failed after migration: %v len=%d", err, len(secret))
+	}
+}
+

@@ -348,8 +348,8 @@ func (s *Server) satisfyAuthRequestReauth(reqID string) {
 		}
 	}
 	nextPrompt := strings.Join(kept, " ")
-	if nextPrompt != ar.Prompt {
-		_ = s.store.ClearAuthRequestPrompt(reqID, nextPrompt)
+	if nextPrompt != ar.Prompt || ar.MaxAge >= 0 {
+		_ = s.store.ClearAuthRequestReauth(reqID, nextPrompt)
 	}
 }
 
