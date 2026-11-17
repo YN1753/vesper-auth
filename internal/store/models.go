@@ -30,16 +30,18 @@ type PasskeyRecord struct {
 
 // Session represents an active browser login session.
 type Session struct {
-	ID         string `json:"id"`
-	TokenHash  string `json:"-"`
-	UserID     string `json:"user_id"`
-	IP         string `json:"ip"`
-	UserAgent  string `json:"user_agent"`
-	AuthMethod string `json:"auth_method"`
-	CreatedAt  int64  `json:"created_at"`
-	LastSeenAt int64  `json:"last_seen_at"`
-	ExpiresAt  int64  `json:"expires_at"`
-	Current    bool   `json:"current,omitempty"`
+	ID          string `json:"id"`
+	TokenHash   string `json:"-"`
+	UserID      string `json:"user_id"`
+	IP          string `json:"ip"`
+	UserAgent   string `json:"user_agent"`
+	DeviceLabel string `json:"device_label,omitempty"`
+	AuthMethod  string `json:"auth_method"`
+	CreatedAt   int64  `json:"created_at"`
+	LastSeenAt  int64  `json:"last_seen_at"`
+	ElevatedAt  int64  `json:"elevated_at"`
+	ExpiresAt   int64  `json:"expires_at"`
+	Current     bool   `json:"current,omitempty"`
 }
 
 // SigningKey stores a persisted RSA signing keypair for RS256 OIDC tokens.
@@ -77,6 +79,8 @@ type AuthRequest struct {
 	Nonce               string
 	CodeChallenge       string
 	CodeChallengeMethod string
+	Prompt              string
+	MaxAge              int64 // -1 when not specified
 	ExpiresAt           int64
 	CreatedAt           int64
 }
@@ -97,7 +101,7 @@ type AuthCode struct {
 	CreatedAt           int64
 }
 
-// AccessTokenRecord tracks issued access tokens for revocation checks.
+// AccessTokenRecord tracks issued access tokens for revocation and introspection checks.
 type AccessTokenRecord struct {
 	JTI       string
 	ClientID  string
@@ -133,6 +137,15 @@ type AuditLog struct {
 	Detail    string `json:"detail"`
 	Status    string `json:"status"`
 	CreatedAt int64  `json:"created_at"`
+}
+
+// AuditFilter specifies optional filtering and pagination parameters for audit log queries.
+type AuditFilter struct {
+	Status   string
+	Category string
+	Query    string
+	Limit    int
+	Offset   int
 }
 
 func nowUnix() int64 {

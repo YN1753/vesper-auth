@@ -1,5 +1,7 @@
 package store
 
+import "strings"
+
 // RecordAudit inserts a security or OAuth event into audit_logs.
 func (s *Store) RecordAudit(eventType, actor, ip, userAgent, target, detail, status string) error {
 	_, err := s.db.Exec(
@@ -12,22 +14,52 @@ func (s *Store) RecordAudit(eventType, actor, ip, userAgent, target, detail, sta
 
 // ListAuditLogs returns audit log entries newest first along with total count.
 func (s *Store) ListAuditLogs(limit, offset int) ([]AuditLog, int, error) {
+	return s.ListAuditLogsFiltered(AuditFilter{Limit: limit, Offset: offset})
+}
+
+// ListAuditLogsFiltered returns audit log entries matching optional status, category prefix, and search query.
+func (s *Store) ListAuditLogsFiltered(f AuditFilter) ([]AuditLog, int, error) {
+	limit := f.Limit
 	if limit <= 0 || limit > 100 {
 		limit = 20
 	}
+	offset := f.Offset
 	if offset < 0 {
 		offset = 0
 	}
 
+	var conds []string
+	var args []any
+
+	if st := strings.TrimSpace(f.Status); st != "" {
+		conds = append(conds, "status = ?")
+		args = append(args, st)
+	}
+	if cat := strings.TrimSpace(f.Category); cat != "" {
+		conds = append(conds, "event_type LIKE ?")
+		args = append(args, cat+"%")
+	}
+	if q := strings.TrimSpace(f.Query); q != "" {
+		like := "%" + q + "%"
+		conds = append(conds, "(actor LIKE ? OR ip LIKE ? OR target LIKE ? OR detail LIKE ? OR event_type LIKE ?)")
+		args = append(args, like, like, like, like, like)
+	}
+
+	whereClause := ""
+	if len(conds) > 0 {
+		whereClause = " WHERE " + strings.Join(conds, " AND ")
+	}
+
 	var total int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM audit_logs`).Scan(&total); err != nil {
+	if err := s.rdb.QueryRow(`SELECT COUNT(1) FROM audit_logs`+whereClause, args...).Scan(&total); err != nil {
 		return nil, 0, err
 	}
 
-	rows, err := s.db.Query(
+	queryArgs := append(append([]any{}, args...), limit, offset)
+	rows, err := s.rdb.Query(
 		`SELECT id, event_type, actor, ip, user_agent, target, detail, status, created_at
-		 FROM audit_logs ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
-		limit, offset,
+		 FROM audit_logs`+whereClause+` ORDER BY created_at DESC, id DESC LIMIT ? OFFSET ?`,
+		queryArgs...,
 	)
 	if err != nil {
 		return nil, 0, err

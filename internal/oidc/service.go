@@ -8,17 +8,20 @@ import (
 	"html/template"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
 	"github.com/YN1753/vesper-auth/internal/auth"
 	"github.com/YN1753/vesper-auth/internal/config"
+	"github.com/YN1753/vesper-auth/internal/notify"
 	"github.com/YN1753/vesper-auth/internal/store"
 )
 
-// TemplateRenderer renders HTML templates for consent and error screens.
+// TemplateRenderer renders HTML templates for consent, logout confirmation, and error screens.
 type TemplateRenderer interface {
 	RenderConsent(w http.ResponseWriter, data ConsentViewData)
+	RenderLogoutConfirm(w http.ResponseWriter, data LogoutConfirmViewData)
 	RenderError(w http.ResponseWriter, status int, title, message string)
 }
 
@@ -36,6 +39,16 @@ type ConsentViewData struct {
 	Email        string
 }
 
+// LogoutConfirmViewData supplies data to the OIDC logout confirmation screen.
+type LogoutConfirmViewData struct {
+	Username              string
+	Email                 string
+	ClientID              string
+	PostLogoutRedirectURI string
+	State                 string
+	CSRFToken             string
+}
+
 // ScopeInfo describes a requested OAuth2/OIDC scope for the user.
 type ScopeInfo struct {
 	Name        string
@@ -49,6 +62,7 @@ type Service struct {
 	keys     *KeySet
 	sessions *auth.SessionManager
 	limiter  *auth.RateLimiter
+	notifier *notify.Notifier
 	renderer TemplateRenderer
 	clientIP func(*http.Request) string
 }
@@ -60,6 +74,7 @@ func NewService(
 	keys *KeySet,
 	sessions *auth.SessionManager,
 	limiter *auth.RateLimiter,
+	notifier *notify.Notifier,
 	renderer TemplateRenderer,
 	clientIP func(*http.Request) string,
 ) *Service {
@@ -69,6 +84,7 @@ func NewService(
 		keys:     keys,
 		sessions: sessions,
 		limiter:  limiter,
+		notifier: notifier,
 		renderer: renderer,
 		clientIP: clientIP,
 	}
@@ -84,6 +100,7 @@ func (s *Service) Discovery(w http.ResponseWriter, r *http.Request) {
 		"userinfo_endpoint":                     iss + "/oauth2/userinfo",
 		"jwks_uri":                              iss + "/.well-known/jwks.json",
 		"revocation_endpoint":                   iss + "/oauth2/revoke",
+		"introspection_endpoint":                iss + "/oauth2/introspect",
 		"end_session_endpoint":                  iss + "/oauth2/logout",
 		"response_types_supported":              []string{"code"},
 		"subject_types_supported":               []string{"public"},
@@ -93,6 +110,7 @@ func (s *Service) Discovery(w http.ResponseWriter, r *http.Request) {
 		"claims_supported":                      []string{"sub", "iss", "aud", "exp", "iat", "auth_time", "nonce", "at_hash", "name", "preferred_username", "email", "email_verified", "role"},
 		"code_challenge_methods_supported":      []string{"S256"},
 		"grant_types_supported":                 []string{"authorization_code", "refresh_token"},
+		"prompt_values_supported":               []string{"none", "login", "consent"},
 	}
 	w.Header().Set("Cache-Control", "public, max-age=300")
 	writeJSON(w, http.StatusOK, doc)
@@ -110,8 +128,10 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 	var req *store.AuthRequest
 	var client *store.OAuthClient
 	var err error
+	fromSavedReq := false
 
 	if reqID := strings.TrimSpace(q.Get("req")); reqID != "" {
+		fromSavedReq = true
 		req, err = s.store.GetAuthRequest(reqID)
 		if err != nil {
 			s.renderErr(w, http.StatusBadRequest, "授权请求无效或已过期", "请返回原应用重新发起登录授权。")
@@ -130,7 +150,7 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 			s.renderErr(w, http.StatusBadRequest, "未知的 OAuth 应用", "client_id 未在 Vesper Auth 中注册。")
 			return
 		}
-		if !isRedirectURIAllowed(client, redirectURI) {
+		if !IsRedirectURIAllowed(client, redirectURI) {
 			s.renderErr(w, http.StatusBadRequest, "回调地址未授权", "redirect_uri 与该应用配置的允许回调列表不匹配。")
 			return
 		}
@@ -141,9 +161,19 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 		scope := normalizeScopes(q.Get("scope"))
 		challenge := strings.TrimSpace(q.Get("code_challenge"))
 		challengeMethod := strings.TrimSpace(q.Get("code_challenge_method"))
+		prompt, promptErr := parsePrompt(q.Get("prompt"))
+		maxAge, maxAgeErr := parseMaxAge(q.Get("max_age"))
 
 		if responseType != "code" {
 			redirectAuthError(w, r, redirectURI, "unsupported_response_type", "only response_type=code is supported", state)
+			return
+		}
+		if promptErr != nil {
+			redirectAuthError(w, r, redirectURI, "invalid_request", promptErr.Error(), state)
+			return
+		}
+		if maxAgeErr != nil {
+			redirectAuthError(w, r, redirectURI, "invalid_request", maxAgeErr.Error(), state)
 			return
 		}
 		if challenge != "" && challengeMethod != "S256" {
@@ -170,6 +200,8 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 			Nonce:               nonce,
 			CodeChallenge:       challenge,
 			CodeChallengeMethod: challengeMethod,
+			Prompt:              prompt,
+			MaxAge:              maxAge,
 			ExpiresAt:           time.Now().Add(10 * time.Minute).Unix(),
 		}
 		if err := s.store.CreateAuthRequest(req); err != nil {
@@ -180,15 +212,42 @@ func (s *Service) AuthorizeGet(w http.ResponseWriter, r *http.Request) {
 
 	ses, user, err := s.sessions.Authenticate(r)
 	if err != nil {
-		// Not logged in: redirect to /login preserving the pending auth request ID.
+		if hasPrompt(req.Prompt, "none") {
+			_ = s.store.DeleteAuthRequest(req.ID)
+			redirectAuthError(w, r, req.RedirectURI, "login_required", "authentication required for prompt=none", req.State)
+			return
+		}
 		http.Redirect(w, r, "/login?req="+url.QueryEscape(req.ID), http.StatusFound)
 		return
 	}
 
-	// Trusted clients skip manual consent when already authenticated.
-	if client.Trusted {
+	// Check OIDC prompt=login or max_age expiration on initial entry before re-authentication.
+	needsReauth := hasPrompt(req.Prompt, "login")
+	if !needsReauth && req.MaxAge >= 0 && !fromSavedReq {
+		if time.Now().Unix()-ses.CreatedAt > req.MaxAge {
+			needsReauth = true
+		}
+	}
+	if needsReauth {
+		if hasPrompt(req.Prompt, "none") {
+			_ = s.store.DeleteAuthRequest(req.ID)
+			redirectAuthError(w, r, req.RedirectURI, "login_required", "session exceeds max_age", req.State)
+			return
+		}
+		http.Redirect(w, r, "/login?req="+url.QueryEscape(req.ID)+"&reauth=1", http.StatusFound)
+		return
+	}
+
+	forceConsent := hasPrompt(req.Prompt, "consent")
+	if client.Trusted && !forceConsent {
 		_ = s.store.DeleteAuthRequest(req.ID)
 		s.issueCodeAndRedirect(w, r, client, user, ses, req)
+		return
+	}
+
+	if hasPrompt(req.Prompt, "none") {
+		_ = s.store.DeleteAuthRequest(req.ID)
+		redirectAuthError(w, r, req.RedirectURI, "consent_required", "user consent required", req.State)
 		return
 	}
 
@@ -332,7 +391,9 @@ func (s *Service) Token(w http.ResponseWriter, r *http.Request) {
 
 	client, err := s.store.GetOAuthClient(clientID)
 	if err != nil {
-		s.limiter.RecordFailure(rlKeys...)
+		if locked, _ := s.limiter.RecordFailure(rlKeys...); locked && s.notifier != nil {
+			s.notifier.Notify("oauth.token_rate_limited", "warning", clientID, ip, clientID, "repeated unknown client token attempts")
+		}
 		_ = s.store.RecordAudit("oauth.token", clientID, ip, r.UserAgent(), clientID, "unknown client", "failure")
 		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client authentication failed")
 		return
@@ -340,7 +401,9 @@ func (s *Service) Token(w http.ResponseWriter, r *http.Request) {
 
 	if !client.IsPublic {
 		if clientSecret == "" || !verifyClientSecret(clientSecret, client.SecretHash) {
-			s.limiter.RecordFailure(rlKeys...)
+			if locked, _ := s.limiter.RecordFailure(rlKeys...); locked && s.notifier != nil {
+				s.notifier.Notify("oauth.token_rate_limited", "warning", client.Name, ip, client.ID, "repeated invalid client_secret attempts")
+			}
 			_ = s.store.RecordAudit("oauth.token", client.Name, ip, r.UserAgent(), client.ID, "invalid client secret", "failure")
 			if usedBasic {
 				w.Header().Set("WWW-Authenticate", `Basic realm="vesper-auth"`)
@@ -448,6 +511,9 @@ func (s *Service) handleRefreshGrant(w http.ResponseWriter, r *http.Request, cli
 		s.limiter.RecordFailure(rlKeys...)
 		if errors.Is(err, store.ErrTokenReused) {
 			_ = s.store.RecordAudit("oauth.refresh_reuse", client.Name, ip, r.UserAgent(), client.ID, "refresh token reuse detected; family revoked", "failure")
+			if s.notifier != nil {
+				s.notifier.Notify("oauth.refresh_reuse", "critical", client.Name, ip, client.ID, "refresh token replay detected; entire token family revoked")
+			}
 			writeOAuthError(w, http.StatusBadRequest, "invalid_grant", "refresh token reuse detected")
 			return
 		}
@@ -589,6 +655,105 @@ func (s *Service) UserInfo(w http.ResponseWriter, r *http.Request) {
 	})
 }
 
+// Introspect handles POST /oauth2/introspect per RFC 7662.
+func (s *Service) Introspect(w http.ResponseWriter, r *http.Request) {
+	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("Pragma", "no-cache")
+
+	if err := r.ParseForm(); err != nil {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "malformed form body")
+		return
+	}
+
+	clientID, clientSecret, usedBasic := extractClientCredentials(r)
+	if clientID == "" {
+		if usedBasic {
+			w.Header().Set("WWW-Authenticate", `Basic realm="vesper-auth"`)
+		}
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client authentication required")
+		return
+	}
+	client, err := s.store.GetOAuthClient(clientID)
+	if err != nil {
+		if usedBasic {
+			w.Header().Set("WWW-Authenticate", `Basic realm="vesper-auth"`)
+		}
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "unknown client")
+		return
+	}
+	if !client.IsPublic && (clientSecret == "" || !verifyClientSecret(clientSecret, client.SecretHash)) {
+		if usedBasic {
+			w.Header().Set("WWW-Authenticate", `Basic realm="vesper-auth"`)
+		}
+		writeOAuthError(w, http.StatusUnauthorized, "invalid_client", "client authentication failed")
+		return
+	}
+
+	rawToken := strings.TrimSpace(r.FormValue("token"))
+	if rawToken == "" {
+		writeOAuthError(w, http.StatusBadRequest, "invalid_request", "token parameter is required")
+		return
+	}
+
+	now := time.Now().Unix()
+
+	// Check as Refresh Token if prefixed or matching DB.
+	if strings.HasPrefix(rawToken, "rt_") {
+		rec, err := s.store.GetRefreshTokenByRaw(rawToken)
+		if err != nil || rec.Revoked || rec.Rotated || rec.ExpiresAt <= now {
+			writeJSON(w, http.StatusOK, map[string]any{"active": false})
+			return
+		}
+		user, uErr := s.store.GetAdminByID(rec.UserID)
+		username := ""
+		if uErr == nil {
+			username = user.Username
+		}
+		writeJSON(w, http.StatusOK, map[string]any{
+			"active":     true,
+			"token_type": "refresh_token",
+			"client_id":  rec.ClientID,
+			"sub":        rec.UserID,
+			"username":   username,
+			"scope":      rec.Scope,
+			"exp":        rec.ExpiresAt,
+			"iat":        rec.CreatedAt,
+			"iss":        s.cfg.Issuer,
+		})
+		return
+	}
+
+	// Check as RS256 Access Token.
+	claims, err := VerifyAccessToken(s.keys, s.cfg.Issuer, rawToken)
+	if err != nil {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	rec, err := s.store.GetAccessTokenRecord(claims.ID)
+	if err != nil || rec.Revoked || rec.ExpiresAt <= now {
+		writeJSON(w, http.StatusOK, map[string]any{"active": false})
+		return
+	}
+	user, uErr := s.store.GetAdminByID(claims.Subject)
+	username := ""
+	if uErr == nil {
+		username = user.Username
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"active":     true,
+		"token_type": "Bearer",
+		"client_id":  claims.ClientID,
+		"sub":        claims.Subject,
+		"username":   username,
+		"role":       claims.Role,
+		"scope":      claims.Scope,
+		"exp":        rec.ExpiresAt,
+		"iat":        rec.CreatedAt,
+		"iss":        s.cfg.Issuer,
+		"jti":        claims.ID,
+	})
+}
+
 // Revoke handles POST /oauth2/revoke per RFC 7009.
 func (s *Service) Revoke(w http.ResponseWriter, r *http.Request) {
 	if err := r.ParseForm(); err != nil {
@@ -634,16 +799,9 @@ func (s *Service) Revoke(w http.ResponseWriter, r *http.Request) {
 	w.WriteHeader(http.StatusOK)
 }
 
-// Logout handles GET and POST /oauth2/logout (OIDC RP-Initiated Logout).
+// Logout handles GET and POST /oauth2/logout (OIDC RP-Initiated Logout with anti-CSRF confirmation).
 func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
-	_, user, sesErr := s.sessions.Authenticate(r)
-	s.sessions.Clear(w, r)
-
-	actor := "anonymous"
-	if sesErr == nil && user != nil {
-		actor = user.Username
-		_ = s.store.RecordAudit("auth.logout", actor, s.clientIP(r), r.UserAgent(), "session", "OIDC end_session logout", "success")
-	}
+	ses, user, sesErr := s.sessions.Authenticate(r)
 
 	q := r.URL.Query()
 	if r.Method == http.MethodPost {
@@ -659,11 +817,48 @@ func (s *Service) Logout(w http.ResponseWriter, r *http.Request) {
 	state := q.Get("state")
 	clientID := strings.TrimSpace(q.Get("client_id"))
 	idTokenHint := strings.TrimSpace(q.Get("id_token_hint"))
+	csrfToken := strings.TrimSpace(q.Get("csrf_token"))
 
-	if clientID == "" && idTokenHint != "" {
-		if claims, err := VerifyIDToken(s.keys, s.cfg.Issuer, idTokenHint, true); err == nil && len(claims.Audience) > 0 {
-			clientID = claims.Audience[0]
+	hintValid := false
+	if idTokenHint != "" {
+		if claims, err := VerifyIDToken(s.keys, s.cfg.Issuer, idTokenHint, true); err == nil {
+			hintValid = true
+			if clientID == "" && len(claims.Audience) > 0 {
+				clientID = claims.Audience[0]
+			}
 		}
+	}
+
+	// If the user is actively signed in and no verified id_token_hint was passed:
+	// - On GET without client_id/post_logout_redirect_uri or without id_token_hint: require interactive confirmation
+	//   unless post_logout_redirect_uri belongs to a registered client AND client_id matches a trusted client!
+	// Wait: let's check OIDC RP-Initiated Logout:
+	// - Trusted personal apps (like Nezha/Alist) might redirect to /oauth2/logout?client_id=...&post_logout_redirect_uri=...
+	//   without id_token_hint, OR an attacker page might embed <img src="https://auth.starryheavens.uk/oauth2/logout">.
+	// Requiring interactive confirmation on GET whenever hintValid == false (unless POST with valid csrf_token)
+	// completely blocks <img src="..."> CSRF logout, while rendering a clean 1-click confirm card in the browser!
+	if sesErr == nil && user != nil && !hintValid {
+		if r.Method == http.MethodPost {
+			if !s.sessions.VerifyCSRF(ses.ID, csrfToken) {
+				s.renderErr(w, http.StatusForbidden, "CSRF 校验失败", "退出登录校验失败，请重试。")
+				return
+			}
+		} else if s.renderer != nil {
+			s.renderer.RenderLogoutConfirm(w, LogoutConfirmViewData{
+				Username:              user.Username,
+				Email:                 user.Email,
+				ClientID:              clientID,
+				PostLogoutRedirectURI: postLogoutURI,
+				State:                 state,
+				CSRFToken:             s.sessions.CSRFToken(ses.ID),
+			})
+			return
+		}
+	}
+
+	s.sessions.Clear(w, r)
+	if sesErr == nil && user != nil {
+		_ = s.store.RecordAudit("auth.logout", user.Username, s.clientIP(r), r.UserAgent(), "session", "OIDC end_session logout", "success")
 	}
 
 	if postLogoutURI != "" && s.isPostLogoutURIAllowed(clientID, postLogoutURI) {
@@ -758,12 +953,92 @@ func extractBearerToken(r *http.Request) string {
 	return ""
 }
 
-func isRedirectURIAllowed(client *store.OAuthClient, candidate string) bool {
+// IsRedirectURIAllowed checks exact match against client.RedirectURIs, plus RFC 8252 Section 7.3
+// dynamic loopback port matching for public native clients.
+func IsRedirectURIAllowed(client *store.OAuthClient, candidate string) bool {
 	if candidate == "" {
 		return false
 	}
 	for _, allowed := range client.RedirectURIs {
 		if allowed == candidate {
+			return true
+		}
+	}
+	if !client.IsPublic {
+		return false
+	}
+
+	cu, err := url.Parse(candidate)
+	if err != nil || !strings.EqualFold(cu.Scheme, "http") || cu.User != nil || cu.Fragment != "" {
+		return false
+	}
+	cHost := cu.Hostname()
+	if !isLoopbackHost(cHost) {
+		return false
+	}
+	if portStr := cu.Port(); portStr != "" {
+		p, pErr := strconv.Atoi(portStr)
+		if pErr != nil || p < 1 || p > 65535 {
+			return false
+		}
+	}
+
+	for _, allowed := range client.RedirectURIs {
+		au, aErr := url.Parse(allowed)
+		if aErr != nil || !strings.EqualFold(au.Scheme, "http") {
+			continue
+		}
+		// Dynamic port allowed when the registered loopback URI omits an explicit port.
+		if au.Port() == "" && strings.EqualFold(au.Hostname(), cHost) && au.Path == cu.Path {
+			return true
+		}
+	}
+	return false
+}
+
+func isLoopbackHost(host string) bool {
+	return host == "127.0.0.1" || host == "::1" || strings.EqualFold(host, "localhost")
+}
+
+func parsePrompt(raw string) (string, error) {
+	fields := strings.Fields(strings.TrimSpace(raw))
+	if len(fields) == 0 {
+		return "", nil
+	}
+	seen := make(map[string]bool, len(fields))
+	var out []string
+	for _, f := range fields {
+		switch f {
+		case "none", "login", "consent", "select_account":
+			if !seen[f] {
+				seen[f] = true
+				out = append(out, f)
+			}
+		default:
+			return "", fmt.Errorf("unsupported prompt value %q", f)
+		}
+	}
+	if seen["none"] && len(out) > 1 {
+		return "", errors.New("prompt=none cannot be combined with other values")
+	}
+	return strings.Join(out, " "), nil
+}
+
+func parseMaxAge(raw string) (int64, error) {
+	raw = strings.TrimSpace(raw)
+	if raw == "" {
+		return -1, nil
+	}
+	n, err := strconv.ParseInt(raw, 10, 64)
+	if err != nil || n < 0 {
+		return -1, errors.New("invalid max_age parameter")
+	}
+	return n, nil
+}
+
+func hasPrompt(promptList, target string) bool {
+	for _, f := range strings.Fields(promptList) {
+		if f == target {
 			return true
 		}
 	}

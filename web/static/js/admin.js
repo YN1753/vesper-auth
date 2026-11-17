@@ -1,19 +1,29 @@
 (function () {
   "use strict";
 
-  const CFG = window.VESPER_CONFIG || { issuer: window.location.origin, csrfToken: "" };
+  const bodyDataset = (document.body && document.body.dataset) || {};
+  const CFG = {
+    issuer: bodyDataset.issuer || window.location.origin,
+    csrfToken: bodyDataset.csrfToken || "",
+  };
+
   const state = {
     clients: [],
     passkeys: [],
     sessions: [],
+    keys: [],
     lastSecrets: {},
     auditPage: 0,
     auditLimit: 20,
     auditTotal: 0,
+    auditStatus: "",
+    auditCategory: "",
+    auditQuery: "",
   };
 
   const PRESETS = {
     nezha: {
+      client_id: "nezha",
       name: "哪吒监控",
       description: "dash.starryheavens.uk 运维监控面板",
       redirect_uris: ["https://dash.starryheavens.uk/oauth2/callback"],
@@ -22,6 +32,7 @@
       is_public: false,
     },
     alist: {
+      client_id: "alist",
       name: "Alist 网盘",
       description: "pan.starryheavens.uk 个人网盘",
       redirect_uris: ["https://pan.starryheavens.uk/api/auth/sso_callback"],
@@ -30,6 +41,7 @@
       is_public: false,
     },
     bothub_web: {
+      client_id: "bothub-web",
       name: "BotHub 2.0 Web",
       description: "bot.starryheavens.uk Web 控制台",
       redirect_uris: ["https://bot.starryheavens.uk/auth/callback"],
@@ -38,6 +50,7 @@
       is_public: false,
     },
     bothub_android: {
+      client_id: "bothub-android",
       name: "BotHub 2.0 Android",
       description: "BotHub Android 原生客户端 (PKCE)",
       redirect_uris: [
@@ -65,9 +78,28 @@
     return d.toLocaleString("zh-CN", { hour12: false });
   }
 
+  function suggestDeviceName() {
+    const ua = (navigator.userAgent || "").toLowerCase();
+    let os = "Device";
+    if (ua.includes("iphone") || ua.includes("ipad")) os = "iOS";
+    else if (ua.includes("android")) os = "Android";
+    else if (ua.includes("macintosh") || ua.includes("mac os x")) os = "Mac";
+    else if (ua.includes("windows")) os = "Windows";
+    else if (ua.includes("linux")) os = "Linux";
+
+    let browser = "";
+    if (ua.includes("edg/")) browser = "Edge";
+    else if (ua.includes("firefox/")) browser = "Firefox";
+    else if (ua.includes("chrome/") || ua.includes("crios/")) browser = "Chrome";
+    else if (ua.includes("safari/")) browser = "Safari";
+
+    return browser ? os + " (" + browser + ")" : os;
+  }
+
   let toastTimer = null;
   function showToast(msg) {
     const el = document.getElementById("toast");
+    if (!el) return;
     el.textContent = msg;
     el.classList.remove("hidden");
     clearTimeout(toastTimer);
@@ -85,19 +117,62 @@
     }
   }
 
-  async function api(url, opts) {
-    const options = Object.assign({ headers: {} }, opts || {});
-    options.headers["X-CSRF-Token"] = CFG.csrfToken;
-    if (options.body && typeof options.body === "object") {
-      options.headers["Content-Type"] = "application/json";
-      options.body = JSON.stringify(options.body);
+  // Sudo Mode modal promise orchestration
+  let pendingSudoResolve = null;
+  let pendingSudoReject = null;
+  const sudoModal = document.getElementById("sudo-modal");
+  const sudoAlert = document.getElementById("sudo-alert");
+
+  function requestSudoElevation() {
+    return new Promise(function (resolve, reject) {
+      pendingSudoResolve = resolve;
+      pendingSudoReject = reject;
+      if (sudoAlert) sudoAlert.classList.add("hidden");
+      const pwdInput = document.getElementById("sudo-password");
+      if (pwdInput) pwdInput.value = "";
+      sudoModal.classList.remove("hidden");
+    });
+  }
+
+  function closeSudoModal(cancelled) {
+    sudoModal.classList.add("hidden");
+    if (cancelled && pendingSudoReject) {
+      const rej = pendingSudoReject;
+      pendingSudoResolve = null;
+      pendingSudoReject = null;
+      rej(new Error("已取消安全验证"));
     }
-    const resp = await fetch(url, options);
+  }
+
+  async function api(url, opts, retried) {
+    const rawOpts = opts || {};
+    const headers = Object.assign({}, rawOpts.headers || {});
+    headers["X-CSRF-Token"] = CFG.csrfToken;
+
+    let bodyPayload = rawOpts.body;
+    if (bodyPayload && typeof bodyPayload === "object") {
+      headers["Content-Type"] = "application/json";
+      bodyPayload = JSON.stringify(bodyPayload);
+    }
+
+    const resp = await fetch(url, {
+      method: rawOpts.method || "GET",
+      headers: headers,
+      body: bodyPayload,
+    });
     const data = await resp.json().catch(function () {
       return {};
     });
+
+    if (resp.status === 403 && data.code === "sudo_required" && !retried) {
+      await requestSudoElevation();
+      return api(url, opts, true);
+    }
+
     if (!resp.ok) {
-      throw new Error(data.error || "请求失败 (" + resp.status + ")");
+      const err = new Error(data.error || "请求失败 (" + resp.status + ")");
+      err.code = data.code;
+      throw err;
     }
     return data;
   }
@@ -126,25 +201,33 @@
         loadSessions();
       } else if (target === "security") {
         loadPasskeys();
+        loadKeys();
       }
     });
   });
 
-  // Load overview
   async function loadOverview() {
     const data = await api("/api/admin/overview");
     state.clients = data.clients || [];
     state.passkeys = data.passkeys || [];
     state.sessions = data.sessions || [];
+    state.keys = data.keys || [];
     renderClients();
     renderPasskeys();
     renderSessions();
+    renderKeys();
   }
 
   async function loadPasskeys() {
     const data = await api("/api/admin/passkeys");
     state.passkeys = data.passkeys || [];
     renderPasskeys();
+  }
+
+  async function loadKeys() {
+    const data = await api("/api/admin/keys");
+    state.keys = data.keys || [];
+    renderKeys();
   }
 
   async function loadSessions() {
@@ -155,7 +238,15 @@
 
   async function loadAudit() {
     const offset = state.auditPage * state.auditLimit;
-    const data = await api("/api/admin/audit?limit=" + state.auditLimit + "&offset=" + offset);
+    const params = new URLSearchParams({
+      limit: String(state.auditLimit),
+      offset: String(offset),
+    });
+    if (state.auditStatus) params.set("status", state.auditStatus);
+    if (state.auditCategory) params.set("category", state.auditCategory);
+    if (state.auditQuery) params.set("q", state.auditQuery);
+
+    const data = await api("/api/admin/audit?" + params.toString());
     state.auditTotal = data.total || 0;
     renderAudit(data.logs || []);
   }
@@ -181,7 +272,7 @@
           : "";
         const urisHtml = (c.redirect_uris || [])
           .map(function (u) {
-            return '<div class="mono" style="font-size:0.8rem;color:var(--text-secondary);">' + esc(u) + "</div>";
+            return '<div class="mono-secondary">' + esc(u) + "</div>";
           })
           .join("");
 
@@ -195,9 +286,9 @@
           pkceBadge +
           "    </div>" +
           (c.description
-            ? '<div style="font-size:0.85rem;color:var(--text-secondary);margin-bottom:6px;">' + esc(c.description) + "</div>"
+            ? '<div class="text-secondary-sm mb-sm">' + esc(c.description) + "</div>"
             : "") +
-          '    <div class="mono" style="font-size:0.82rem;color:var(--accent);margin-bottom:4px;">client_id: ' + esc(c.id) + "</div>" +
+          '    <div class="mono-accent">client_id: ' + esc(c.id) + "</div>" +
           urisHtml +
           "  </div>" +
           '  <div class="item-actions">' +
@@ -224,7 +315,7 @@
         openGuideModal(client);
       });
       card.querySelector(".act-edit").addEventListener("click", function () {
-        openClientModal(client);
+        openClientModal(client, null);
       });
       const rotateBtn = card.querySelector(".act-rotate");
       if (rotateBtn) {
@@ -273,7 +364,7 @@
           '      <span class="item-title">' + esc(p.name) + "</span>" +
           '      <span class="badge badge-gold">SignCount: ' + esc(p.sign_count) + "</span>" +
           "    </div>" +
-          '    <div class="mono" style="font-size:0.78rem;color:var(--text-muted);">Credential: ' + esc(shortCred) + "</div>" +
+          '    <div class="mono-muted">Credential: ' + esc(shortCred) + "</div>" +
           '    <div class="item-meta"><span>绑定时间: ' + esc(fmtTime(p.created_at)) + "</span><span>最近使用: " + esc(fmtTime(p.last_used_at)) + "</span></div>" +
           "  </div>" +
           '  <div class="item-actions">' +
@@ -320,6 +411,35 @@
     });
   }
 
+  function renderKeys() {
+    const root = document.getElementById("keys-list");
+    if (!root) return;
+    if (!state.keys.length) {
+      root.innerHTML = '<div class="item-card"><div class="item-main">暂无密钥记录</div></div>';
+      return;
+    }
+
+    root.innerHTML = state.keys
+      .map(function (k) {
+        const statusBadge = k.active
+          ? '<span class="badge badge-success">当前签发密钥 (Active)</span>'
+          : '<span class="badge">验签宽限保留</span>';
+        return (
+          '<div class="item-card">' +
+          '  <div class="item-main">' +
+          '    <div class="item-title-row">' +
+          '      <span class="mono-accent mb-0">kid: ' + esc(k.kid) + "</span>" +
+          statusBadge +
+          '      <span class="badge">' + esc(k.algorithm) + "</span>" +
+          "    </div>" +
+          '    <div class="item-meta"><span>创建时间: ' + esc(fmtTime(k.created_at)) + "</span></div>" +
+          "  </div>" +
+          "</div>"
+        );
+      })
+      .join("");
+  }
+
   function renderSessions() {
     const root = document.getElementById("sessions-list");
     if (!state.sessions.length) {
@@ -336,16 +456,18 @@
           s.auth_method === "passkey"
             ? '<span class="badge badge-gold">Passkey</span>'
             : '<span class="badge">主密码</span>';
+        const deviceTitle = s.device_label || "Browser";
 
         return (
           '<div class="item-card" data-ses-id="' + esc(s.id) + '">' +
           '  <div class="item-main">' +
           '    <div class="item-title-row">' +
-          '      <span class="mono">' + esc(s.ip || "unknown") + "</span>" +
+          '      <span class="item-title">' + esc(deviceTitle) + "</span>" +
+          '      <span class="badge mono-xs">' + esc(s.ip || "unknown") + "</span>" +
           currentBadge +
           methodBadge +
           "    </div>" +
-          '    <div style="font-size:0.82rem;color:var(--text-secondary);word-break:break-word;">' + esc(s.user_agent || "-") + "</div>" +
+          '    <div class="text-secondary-sm">' + esc(s.user_agent || "-") + "</div>" +
           '    <div class="item-meta"><span>登录时间: ' + esc(fmtTime(s.created_at)) + "</span><span>最近活跃: " + esc(fmtTime(s.last_seen_at)) + "</span></div>" +
           "  </div>" +
           '  <div class="item-actions">' +
@@ -376,7 +498,7 @@
   function renderAudit(logs) {
     const tbody = document.getElementById("audit-tbody");
     if (!logs.length) {
-      tbody.innerHTML = '<tr><td colspan="6" style="color:var(--text-muted);">暂无审计记录</td></tr>';
+      tbody.innerHTML = '<tr><td colspan="6" class="text-muted-cell">暂无匹配的审计记录</td></tr>';
     } else {
       tbody.innerHTML = logs
         .map(function (l) {
@@ -386,12 +508,12 @@
               : '<span class="badge badge-danger">失败</span>';
           return (
             "<tr>" +
-            '<td class="mono" style="font-size:0.78rem;white-space:nowrap;">' + esc(fmtTime(l.created_at)) + "</td>" +
+            '<td class="mono-xs nowrap">' + esc(fmtTime(l.created_at)) + "</td>" +
             "<td>" + stBadge + "</td>" +
-            '<td class="mono" style="font-size:0.8rem;">' + esc(l.event_type) + "</td>" +
+            '<td class="mono-xs">' + esc(l.event_type) + "</td>" +
             "<td>" + esc(l.actor) + "</td>" +
-            '<td class="mono" style="font-size:0.8rem;">' + esc(l.ip || "-") + "</td>" +
-            '<td><div>' + esc(l.target || "-") + '</div><div class="field-hint" style="margin:2px 0 0;">' + esc(l.detail) + "</div></td>" +
+            '<td class="mono-xs">' + esc(l.ip || "-") + "</td>" +
+            "<td><div>" + esc(l.target || "-") + '</div><div class="field-hint-tight">' + esc(l.detail) + "</div></td>" +
             "</tr>"
           );
         })
@@ -409,15 +531,28 @@
   // Client Modal
   const clientModal = document.getElementById("client-modal");
   function openClientModal(client, preset) {
-    document.getElementById("client-edit-id").value = client ? client.id : "";
-    document.getElementById("client-modal-title").textContent = client
+    const isEdit = !!client;
+    document.getElementById("client-edit-id").value = isEdit ? client.id : "";
+    document.getElementById("client-modal-title").textContent = isEdit
       ? "编辑应用: " + client.name
       : "新增 OAuth2 应用";
+
+    const idFieldWrap = document.getElementById("client-custom-id-field");
+    const idInput = document.getElementById("client-custom-id");
+    if (isEdit) {
+      idFieldWrap.classList.add("hidden");
+      idInput.value = "";
+    } else {
+      idFieldWrap.classList.remove("hidden");
+      idInput.value = (preset && preset.client_id) || "";
+    }
+
     const src = client || preset || {};
     document.getElementById("client-name").value = src.name || "";
     document.getElementById("client-desc").value = src.description || "";
     document.getElementById("client-uris").value = (src.redirect_uris || []).join("\n");
-    document.getElementById("client-trusted").checked = src.trusted !== undefined ? !!src.trusted : true;
+    document.getElementById("client-trusted").checked =
+      src.trusted !== undefined ? !!src.trusted : true;
     document.getElementById("client-public").checked = !!src.is_public;
     document.getElementById("client-pkce").checked = !!src.pkce_required || !!src.is_public;
     clientModal.classList.remove("hidden");
@@ -466,13 +601,20 @@
       is_public: document.getElementById("client-public").checked,
       pkce_required: document.getElementById("client-pkce").checked,
     };
+    if (!editId) {
+      body.client_id = document.getElementById("client-custom-id").value.trim();
+    }
 
     try {
       if (editId) {
-        await api("/api/admin/clients/" + encodeURIComponent(editId), {
+        const res = await api("/api/admin/clients/" + encodeURIComponent(editId), {
           method: "PUT",
           body: body,
         });
+        if (res.client_secret && res.client) {
+          state.lastSecrets[res.client.id] = res.client_secret;
+          showSecretBanner(res.client.name, res.client_secret);
+        }
         showToast("应用配置已更新");
       } else {
         const res = await api("/api/admin/clients", {
@@ -501,7 +643,7 @@
       : "";
     return (
       '<div class="kv-row">' +
-      '  <div style="min-width:0;flex:1;">' +
+      '  <div class="kv-cell">' +
       '    <div class="kv-key">' + esc(label) + "</div>" +
       '    <div class="kv-val">' + esc(valStr) + "</div>" +
       "  </div>" +
@@ -529,10 +671,15 @@
         authorization_endpoint: iss + "/oauth2/authorize",
         token_endpoint: iss + "/oauth2/token",
         userinfo_endpoint: iss + "/oauth2/userinfo",
+        introspection_endpoint: iss + "/oauth2/introspect",
         jwks_uri: iss + "/.well-known/jwks.json",
         end_session_endpoint: iss + "/oauth2/logout",
         client_id: client.id,
-        client_secret: hasPlainSecret ? state.lastSecrets[client.id] : client.is_public ? null : "<reset_to_reveal>",
+        client_secret: hasPlainSecret
+          ? state.lastSecrets[client.id]
+          : client.is_public
+          ? null
+          : "<reset_to_reveal>",
         redirect_uris: client.redirect_uris,
         scopes: client.is_public ? "openid profile email offline_access" : "openid profile email",
       },
@@ -541,7 +688,7 @@
     );
 
     const html =
-      '<div style="margin-bottom:16px;"><button id="copy-all-bundle" class="btn btn-primary btn-block" type="button">一键复制完整 JSON 接入配置</button></div>' +
+      '<div class="mb-md"><button id="copy-all-bundle" class="btn btn-primary btn-block" type="button">一键复制完整 JSON 接入配置</button></div>' +
       '<div class="kv-table">' +
       kvRow("OIDC Discovery URL (推荐)", discovery, true) +
       kvRow("Client ID", client.id, true) +
@@ -549,11 +696,22 @@
       kvRow("Authorization Endpoint", iss + "/oauth2/authorize", true) +
       kvRow("Token Endpoint", iss + "/oauth2/token", true) +
       kvRow("UserInfo Endpoint", iss + "/oauth2/userinfo", true) +
+      kvRow("Introspection Endpoint", iss + "/oauth2/introspect", true) +
       kvRow("JWKS URI", iss + "/.well-known/jwks.json", true) +
       kvRow("End Session (Logout) Endpoint", iss + "/oauth2/logout", true) +
       kvRow("回调地址 (Redirect URI)", (client.redirect_uris || []).join(" , "), true) +
-      kvRow("哪吒监控 (Nezha) 字段映射", "OAuth2 Type: OIDC / Endpoint: " + discovery + " / Scopes: openid profile email", false) +
-      kvRow("Alist 网盘字段映射", "SSO Client ID & Secret + OIDC Endpoint: " + discovery + " / Callback: https://pan.starryheavens.uk/api/auth/sso_callback", false) +
+      kvRow(
+        "哪吒监控 (Nezha) 字段映射",
+        "OAuth2 Type: OIDC / Endpoint: " + discovery + " / Scopes: openid profile email",
+        false
+      ) +
+      kvRow(
+        "Alist 网盘字段映射",
+        "SSO Client ID & Secret + OIDC Endpoint: " +
+          discovery +
+          " / Callback: https://pan.starryheavens.uk/api/auth/sso_callback",
+        false
+      ) +
       "</div>";
 
     const bodyEl = document.getElementById("guide-body");
@@ -574,6 +732,87 @@
     guideModal.classList.add("hidden");
   });
 
+  // Backdrop click & Escape key dismissal for all modals
+  [clientModal, guideModal, sudoModal].forEach(function (backdrop) {
+    if (!backdrop) return;
+    backdrop.addEventListener("click", function (e) {
+      if (e.target === backdrop) {
+        if (backdrop === sudoModal) {
+          closeSudoModal(true);
+        } else {
+          backdrop.classList.add("hidden");
+        }
+      }
+    });
+  });
+
+  document.addEventListener("keydown", function (e) {
+    if (e.key !== "Escape") return;
+    if (sudoModal && !sudoModal.classList.contains("hidden")) {
+      closeSudoModal(true);
+      return;
+    }
+    if (!guideModal.classList.contains("hidden")) {
+      guideModal.classList.add("hidden");
+      return;
+    }
+    if (!clientModal.classList.contains("hidden")) {
+      closeClientModal();
+    }
+  });
+
+  // Sudo Modal buttons
+  document.getElementById("sudo-modal-close").addEventListener("click", function () {
+    closeSudoModal(true);
+  });
+
+  document.getElementById("sudo-passkey-btn").addEventListener("click", async function () {
+    const btn = document.getElementById("sudo-passkey-btn");
+    sudoAlert.classList.add("hidden");
+    btn.disabled = true;
+    try {
+      await window.VesperWebAuthn.sudo(CFG.csrfToken);
+      const res = pendingSudoResolve;
+      pendingSudoResolve = null;
+      pendingSudoReject = null;
+      sudoModal.classList.add("hidden");
+      if (res) res();
+    } catch (err) {
+      sudoAlert.textContent = err.message || "Passkey 验证失败";
+      sudoAlert.classList.remove("hidden");
+    } finally {
+      btn.disabled = false;
+    }
+  });
+
+  document.getElementById("sudo-password-form").addEventListener("submit", async function (e) {
+    e.preventDefault();
+    sudoAlert.classList.add("hidden");
+    const pwd = document.getElementById("sudo-password").value;
+    try {
+      const resp = await fetch("/api/admin/sudo/password", {
+        method: "POST",
+        headers: {
+          "Content-Type": "application/json",
+          "X-CSRF-Token": CFG.csrfToken,
+        },
+        body: JSON.stringify({ password: pwd }),
+      });
+      const data = await resp.json();
+      if (!resp.ok) {
+        throw new Error(data.error || "主密码验证失败");
+      }
+      const res = pendingSudoResolve;
+      pendingSudoResolve = null;
+      pendingSudoReject = null;
+      sudoModal.classList.add("hidden");
+      if (res) res();
+    } catch (err) {
+      sudoAlert.textContent = err.message;
+      sudoAlert.classList.remove("hidden");
+    }
+  });
+
   // Secret banner
   document.getElementById("copy-banner-secret").addEventListener("click", function () {
     copyText(document.getElementById("secret-banner-value").textContent, "Client Secret");
@@ -582,19 +821,23 @@
     document.getElementById("global-secret-banner").classList.add("hidden");
   });
 
-  // Passkey registration
+  // Passkey registration with auto-suggested device name
+  const passkeyDeviceInput = document.getElementById("passkey-device-name");
+  if (passkeyDeviceInput && !passkeyDeviceInput.value) {
+    passkeyDeviceInput.value = suggestDeviceName();
+  }
+
   document.getElementById("register-passkey-form").addEventListener("submit", async function (e) {
     e.preventDefault();
     const btn = document.getElementById("register-passkey-btn");
-    const nameInput = document.getElementById("passkey-device-name");
-    const deviceName = nameInput.value.trim();
+    const deviceName = passkeyDeviceInput.value.trim();
     if (!deviceName) return;
 
     btn.disabled = true;
     btn.textContent = "请在设备上完成生物识别验证...";
     try {
-      await window.VesperWebAuthn.register(deviceName);
-      nameInput.value = "";
+      await window.VesperWebAuthn.register(deviceName, CFG.csrfToken);
+      passkeyDeviceInput.value = suggestDeviceName();
       showToast("Passkey 绑定成功");
       await loadPasskeys();
     } catch (err) {
@@ -602,6 +845,24 @@
     } finally {
       btn.disabled = false;
       btn.textContent = "绑定当前设备 Passkey";
+    }
+  });
+
+  // Rotate RSA Signing Key
+  document.getElementById("rotate-key-btn").addEventListener("click", async function () {
+    if (
+      !confirm(
+        "轮换 RSA 签名密钥将生成新活跃密钥用于后续签发，旧公钥将继续保留在 JWKS 中供存量令牌平滑验签。确认执行？"
+      )
+    ) {
+      return;
+    }
+    try {
+      const res = await api("/api/admin/keys/rotate", { method: "POST" });
+      showToast("签名密钥已轮换 (kid: " + res.kid + ")");
+      await loadKeys();
+    } catch (err) {
+      showToast(err.message);
     }
   });
 
@@ -629,6 +890,7 @@
     const cur = document.getElementById("current-password").value;
     const nw = document.getElementById("new-password").value;
     const cf = document.getElementById("confirm-new-password").value;
+    const revokeTokens = document.getElementById("revoke-all-tokens").checked;
     if (nw !== cf) {
       showToast("两次输入的新密码不一致");
       return;
@@ -636,10 +898,14 @@
     try {
       await api("/api/admin/password", {
         method: "POST",
-        body: { current_password: cur, new_password: nw },
+        body: {
+          current_password: cur,
+          new_password: nw,
+          revoke_tokens: revokeTokens,
+        },
       });
       e.target.reset();
-      showToast("主密码已更新");
+      showToast("主密码已更新，其他会话已自动清理");
     } catch (err) {
       showToast(err.message);
     }
@@ -655,6 +921,21 @@
     } catch (err) {
       showToast(err.message);
     }
+  });
+
+  function applyAuditFilter() {
+    state.auditStatus = document.getElementById("audit-filter-status").value;
+    state.auditCategory = document.getElementById("audit-filter-category").value;
+    state.auditQuery = document.getElementById("audit-filter-query").value.trim();
+    state.auditPage = 0;
+    loadAudit();
+  }
+
+  document.getElementById("audit-filter-status").addEventListener("change", applyAuditFilter);
+  document.getElementById("audit-filter-category").addEventListener("change", applyAuditFilter);
+  document.getElementById("audit-filter-form").addEventListener("submit", function (e) {
+    e.preventDefault();
+    applyAuditFilter();
   });
 
   document.getElementById("refresh-audit-btn").addEventListener("click", loadAudit);

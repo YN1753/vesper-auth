@@ -3,7 +3,7 @@ package main
 import (
 	"context"
 	"errors"
-	"log"
+	"log/slog"
 	"net/http"
 	"os"
 	"os/signal"
@@ -11,37 +11,68 @@ import (
 	"time"
 
 	"github.com/YN1753/vesper-auth/internal/auth"
+	"github.com/YN1753/vesper-auth/internal/cli"
 	"github.com/YN1753/vesper-auth/internal/config"
 	"github.com/YN1753/vesper-auth/internal/server"
 	"github.com/YN1753/vesper-auth/internal/store"
 )
 
+var (
+	version   = "dev"
+	commit    = "none"
+	buildTime = "unknown"
+)
+
 func main() {
-	log.SetFlags(log.LstdFlags | log.LUTC)
+	logger := slog.New(slog.NewTextHandler(os.Stderr, &slog.HandlerOptions{Level: slog.LevelInfo}))
+	slog.SetDefault(logger)
+
+	handled, err := cli.Run(os.Args[1:], cli.BuildInfo{
+		Version:   version,
+		Commit:    commit,
+		BuildTime: buildTime,
+	}, os.Stdin, os.Stdout, os.Stderr)
+	if handled {
+		if err != nil {
+			slog.Error("cli command failed", "err", err)
+			os.Exit(1)
+		}
+		return
+	}
 
 	cfg, err := config.LoadFromEnv()
 	if err != nil {
-		log.Fatalf("vesper-auth: config error: %v", err)
+		slog.Error("config error", "err", err)
+		os.Exit(1)
 	}
 
 	st, err := store.Open(cfg.DBPath)
 	if err != nil {
-		log.Fatalf("vesper-auth: database open error: %v", err)
+		slog.Error("database open error", "err", err)
+		os.Exit(1)
 	}
 	defer func() {
 		if err := st.Close(); err != nil {
-			log.Printf("vesper-auth: database close error: %v", err)
+			slog.Warn("database close error", "err", err)
 		}
 	}()
 
 	if err := bootstrapAdminIfConfigured(cfg, st); err != nil {
-		log.Fatalf("vesper-auth: admin bootstrap error: %v", err)
+		slog.Error("admin bootstrap error", "err", err)
+		os.Exit(1)
 	}
+
+	maintCtx, stopMaint := context.WithCancel(context.Background())
+	defer stopMaint()
+	st.StartMaintenanceLoop(maintCtx, time.Hour, cfg.AuditRetentionDays)
 
 	srv, err := server.New(cfg, st)
 	if err != nil {
-		log.Fatalf("vesper-auth: server init error: %v", err)
+		slog.Error("server init error", "err", err)
+		os.Exit(1)
 	}
+	srv.SetVersion(version)
+	defer srv.Close()
 
 	httpServer := &http.Server{
 		Addr:              cfg.ListenAddr,
@@ -54,7 +85,12 @@ func main() {
 
 	errCh := make(chan error, 1)
 	go func() {
-		log.Printf("vesper-auth listening on %s (issuer=%s, db=%s)", cfg.ListenAddr, cfg.Issuer, cfg.DBPath)
+		slog.Info("vesper-auth listening",
+			"addr", cfg.ListenAddr,
+			"issuer", cfg.Issuer,
+			"db", cfg.DBPath,
+			"version", version,
+		)
 		errCh <- httpServer.ListenAndServe()
 	}()
 
@@ -63,15 +99,17 @@ func main() {
 
 	select {
 	case sig := <-sigCh:
-		log.Printf("vesper-auth received signal %s, shutting down", sig)
+		slog.Info("received shutdown signal", "signal", sig.String())
+		stopMaint()
 		ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 		defer cancel()
 		if err := httpServer.Shutdown(ctx); err != nil {
-			log.Printf("vesper-auth graceful shutdown error: %v", err)
+			slog.Warn("graceful shutdown error", "err", err)
 		}
 	case err := <-errCh:
 		if err != nil && !errors.Is(err, http.ErrServerClosed) {
-			log.Fatalf("vesper-auth server error: %v", err)
+			slog.Error("http server error", "err", err)
+			os.Exit(1)
 		}
 	}
 }
@@ -85,7 +123,7 @@ func bootstrapAdminIfConfigured(cfg *config.Config, st *store.Store) error {
 		return nil
 	}
 	if cfg.AdminPassword == "" {
-		log.Printf("vesper-auth: no admin user found; open %s/setup in browser to initialize", cfg.Issuer)
+		slog.Info("no admin user found; open /setup in browser to initialize", "setup_url", cfg.Issuer+"/setup")
 		return nil
 	}
 
@@ -98,6 +136,6 @@ func bootstrapAdminIfConfigured(cfg *config.Config, st *store.Store) error {
 		return err
 	}
 	_ = st.RecordAudit("auth.bootstrap", user.Username, "127.0.0.1", "vesper-auth-init", user.ID, "admin bootstrapped from environment", "success")
-	log.Printf("vesper-auth: bootstrapped administrator %q (%s)", user.Username, user.Email)
+	slog.Info("bootstrapped administrator", "username", user.Username, "email", user.Email)
 	return nil
 }

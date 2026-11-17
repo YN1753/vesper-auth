@@ -2,14 +2,19 @@ package server
 
 import (
 	"errors"
+	"fmt"
 	"net/http"
 	"net/url"
+	"regexp"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/YN1753/vesper-auth/internal/auth"
 	"github.com/YN1753/vesper-auth/internal/store"
 )
+
+var validCustomClientID = regexp.MustCompile(`^[a-zA-Z0-9][a-zA-Z0-9._-]{1,62}$`)
 
 type adminHandler func(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser)
 
@@ -30,6 +35,102 @@ func (s *Server) withAdmin(requireCSRF bool, fn adminHandler) http.HandlerFunc {
 		_ = s.store.TouchSession(ses.ID, s.clientIP(r))
 		fn(w, r, ses, user)
 	}
+}
+
+func (s *Server) withSudo(fn adminHandler) adminHandler {
+	return func(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+		sudoTTL := s.cfg.SudoTTL
+		if sudoTTL <= 0 {
+			sudoTTL = 15 * time.Minute
+		}
+		if time.Now().Unix()-ses.ElevatedAt > int64(sudoTTL.Seconds()) {
+			writeJSON(w, http.StatusForbidden, map[string]string{
+				"error": "执行高危操作前需完成二次身份验证",
+				"code":  "sudo_required",
+			})
+			return
+		}
+		fn(w, r, ses, user)
+	}
+}
+
+func (s *Server) handleSudoPassword(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+	ip := s.clientIP(r)
+	rlKeys := []string{"sudo:ip:" + ip, "sudo:user:" + user.ID}
+	if ok, wait := s.limiter.Check(rlKeys...); !ok {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		writeAPIError(w, http.StatusTooManyRequests, "验证失败次数过多，请稍后再试")
+		return
+	}
+
+	var req struct {
+		Password string `json:"password"`
+	}
+	if err := decodeJSON(r, &req); err != nil {
+		writeAPIError(w, http.StatusBadRequest, "请求参数格式错误")
+		return
+	}
+
+	valid, err := auth.VerifyPassword(req.Password, user.PasswordHash)
+	if err != nil || !valid {
+		s.limiter.RecordFailure(rlKeys...)
+		_ = s.store.RecordAudit("admin.sudo_verify", user.Username, ip, r.UserAgent(), "password", "sudo password mismatch", "failure")
+		writeAPIError(w, http.StatusUnauthorized, "管理员主密码不正确")
+		return
+	}
+
+	s.limiter.Reset(rlKeys...)
+	if err := s.store.ElevateSession(user.ID, ses.ID); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "更新会话状态失败")
+		return
+	}
+	_ = s.store.RecordAudit("admin.sudo_verify", user.Username, ip, r.UserAgent(), "password", "session elevated", "success")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "elevated"})
+}
+
+func (s *Server) handleSudoPasskeyBegin(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+	cid, assertion, err := s.passkeys.BeginSudoAssertion(user)
+	if err != nil {
+		writeAPIError(w, http.StatusBadRequest, err.Error())
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ceremony_id": cid,
+		"options":     assertion,
+	})
+}
+
+func (s *Server) handleSudoPasskeyFinish(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+	ip := s.clientIP(r)
+	ceremonyID := strings.TrimSpace(r.Header.Get("X-Ceremony-ID"))
+	if ceremonyID == "" {
+		ceremonyID = strings.TrimSpace(r.URL.Query().Get("ceremony_id"))
+	}
+	if ceremonyID == "" {
+		writeAPIError(w, http.StatusBadRequest, "缺少 ceremony_id")
+		return
+	}
+
+	if err := s.passkeys.FinishSudoAssertion(user, ceremonyID, r); err != nil {
+		if errors.Is(err, auth.ErrCloneWarning) {
+			_ = s.store.RecordAudit("passkey.clone_detected", user.Username, ip, r.UserAgent(), "sudo", "authenticator clone warning", "failure")
+			if s.notifier != nil {
+				s.notifier.Notify("passkey.clone_detected", "critical", user.Username, ip, "sudo", "authenticator clone warning during sudo")
+			}
+			writeAPIError(w, http.StatusForbidden, "检测到硬件密钥计数器异常回退，验证已拦截")
+			return
+		}
+		_ = s.store.RecordAudit("admin.sudo_verify", user.Username, ip, r.UserAgent(), "passkey", err.Error(), "failure")
+		writeAPIError(w, http.StatusUnauthorized, "Passkey 验证失败")
+		return
+	}
+
+	if err := s.store.ElevateSession(user.ID, ses.ID); err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "更新会话状态失败")
+		return
+	}
+	_ = s.store.RecordAudit("admin.sudo_verify", user.Username, ip, r.UserAgent(), "passkey", "session elevated", "success")
+	writeJSON(w, http.StatusOK, map[string]string{"status": "elevated"})
 }
 
 func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
@@ -55,12 +156,12 @@ func (s *Server) handleAdminPage(w http.ResponseWriter, r *http.Request) {
 		displayName = user.Username
 	}
 	s.renderer.RenderAdmin(w, AdminViewData{
-		Issuer:        s.cfg.Issuer,
-		Username:      user.Username,
-		Email:         user.Email,
-		DisplayName:   displayName,
-		IssuerJSON:    toJSString(s.cfg.Issuer),
-		CSRFTokenJSON: toJSString(s.sessions.CSRFToken(ses.ID)),
+		Issuer:      s.cfg.Issuer,
+		Username:    user.Username,
+		Email:       user.Email,
+		DisplayName: displayName,
+		CSRFToken:   s.sessions.CSRFToken(ses.ID),
+		Version:     s.version,
 	})
 }
 
@@ -85,6 +186,7 @@ func (s *Server) handleAdminOverview(w http.ResponseWriter, r *http.Request, ses
 		"clients":  clients,
 		"passkeys": passkeys,
 		"sessions": sessions,
+		"keys":     s.keys.Metadata(),
 	})
 }
 
@@ -120,6 +222,7 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 	var req struct {
 		CurrentPassword string `json:"current_password"`
 		NewPassword     string `json:"new_password"`
+		RevokeTokens    bool   `json:"revoke_tokens"`
 	}
 	if err := decodeJSON(r, &req); err != nil {
 		writeAPIError(w, http.StatusBadRequest, "请求参数格式错误")
@@ -130,9 +233,10 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 		return
 	}
 
+	ip := s.clientIP(r)
 	ok, err := auth.VerifyPassword(req.CurrentPassword, user.PasswordHash)
 	if err != nil || !ok {
-		_ = s.store.RecordAudit("admin.password_change", user.Username, s.clientIP(r), r.UserAgent(), user.ID, "current password mismatch", "failure")
+		_ = s.store.RecordAudit("admin.password_change", user.Username, ip, r.UserAgent(), user.ID, "current password mismatch", "failure")
 		writeAPIError(w, http.StatusUnauthorized, "当前主密码不正确")
 		return
 	}
@@ -146,8 +250,22 @@ func (s *Server) handleChangePassword(w http.ResponseWriter, r *http.Request, se
 		writeAPIError(w, http.StatusInternalServerError, "密码更新失败")
 		return
 	}
-	_ = s.store.RecordAudit("admin.password_change", user.Username, s.clientIP(r), r.UserAgent(), user.ID, "master password updated", "success")
-	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+
+	revokedSessions, _ := s.store.DeleteOtherSessions(user.ID, ses.ID)
+	if req.RevokeTokens {
+		_ = s.store.RevokeAllUserTokens(user.ID)
+	}
+	_ = s.store.ElevateSession(user.ID, ses.ID)
+
+	detail := fmt.Sprintf("revoked_other_sessions=%d revoke_tokens=%t", revokedSessions, req.RevokeTokens)
+	_ = s.store.RecordAudit("admin.password_change", user.Username, ip, r.UserAgent(), user.ID, detail, "success")
+	if s.notifier != nil {
+		s.notifier.Notify("admin.password_change", "info", user.Username, ip, user.ID, detail)
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"status":           "ok",
+		"revoked_sessions": revokedSessions,
+	})
 }
 
 func (s *Server) handleListPasskeys(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
@@ -193,13 +311,17 @@ func (s *Server) handlePasskeyRegisterFinish(w http.ResponseWriter, r *http.Requ
 		return
 	}
 
+	ip := s.clientIP(r)
 	rec, err := s.passkeys.FinishRegistration(user, ceremonyID, r)
 	if err != nil {
-		_ = s.store.RecordAudit("passkey.add", user.Username, s.clientIP(r), r.UserAgent(), "passkey", err.Error(), "failure")
+		_ = s.store.RecordAudit("passkey.add", user.Username, ip, r.UserAgent(), "passkey", err.Error(), "failure")
 		writeAPIError(w, http.StatusBadRequest, "Passkey 注册验证失败: "+err.Error())
 		return
 	}
-	_ = s.store.RecordAudit("passkey.add", user.Username, s.clientIP(r), r.UserAgent(), rec.Name, "id="+rec.ID, "success")
+	_ = s.store.RecordAudit("passkey.add", user.Username, ip, r.UserAgent(), rec.Name, "id="+rec.ID, "success")
+	if s.notifier != nil {
+		s.notifier.Notify("passkey.add", "info", user.Username, ip, rec.Name, "new passkey registered: "+rec.ID)
+	}
 	writeJSON(w, http.StatusCreated, map[string]any{"passkey": rec})
 }
 
@@ -226,6 +348,7 @@ func (s *Server) handleRenamePasskey(w http.ResponseWriter, r *http.Request, ses
 
 func (s *Server) handleDeletePasskey(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
 	id := r.PathValue("id")
+	ip := s.clientIP(r)
 	name, err := s.store.DeletePasskey(user.ID, id)
 	if err != nil {
 		if errors.Is(err, store.ErrNotFound) {
@@ -235,8 +358,38 @@ func (s *Server) handleDeletePasskey(w http.ResponseWriter, r *http.Request, ses
 		writeAPIError(w, http.StatusInternalServerError, "删除 Passkey 失败")
 		return
 	}
-	_ = s.store.RecordAudit("passkey.delete", user.Username, s.clientIP(r), r.UserAgent(), name, "id="+id, "success")
+	_ = s.store.RecordAudit("passkey.delete", user.Username, ip, r.UserAgent(), name, "id="+id, "success")
+	if s.notifier != nil {
+		s.notifier.Notify("passkey.delete", "warning", user.Username, ip, name, "passkey unbound: "+id)
+	}
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) handleListKeys(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+	writeJSON(w, http.StatusOK, map[string]any{
+		"keys": s.keys.Metadata(),
+	})
+}
+
+func (s *Server) handleRotateKey(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
+	ip := s.clientIP(r)
+	retain := s.cfg.KeyRetainCount
+	if retain < 2 {
+		retain = 3
+	}
+	rk, err := s.keys.Rotate(s.store, retain)
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "轮换签名密钥失败: "+err.Error())
+		return
+	}
+	_ = s.store.RecordAudit("admin.key_rotate", user.Username, ip, r.UserAgent(), rk.KID, "rotated RS256 signing key", "success")
+	if s.notifier != nil {
+		s.notifier.Notify("admin.key_rotate", "info", user.Username, ip, rk.KID, "RS256 signing key rotated")
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"kid":  rk.KID,
+		"keys": s.keys.Metadata(),
+	})
 }
 
 func (s *Server) handleListSessions(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
@@ -277,6 +430,7 @@ func (s *Server) handleRevokeOtherSessions(w http.ResponseWriter, r *http.Reques
 }
 
 type clientPayload struct {
+	ClientID     string   `json:"client_id"`
 	Name         string   `json:"name"`
 	Description  string   `json:"description"`
 	RedirectURIs []string `json:"redirect_uris"`
@@ -300,6 +454,19 @@ func (s *Server) handleCreateClient(w http.ResponseWriter, r *http.Request, ses 
 		writeAPIError(w, http.StatusBadRequest, "请求参数格式错误")
 		return
 	}
+
+	customID := strings.TrimSpace(req.ClientID)
+	if customID != "" {
+		if !validCustomClientID.MatchString(customID) {
+			writeAPIError(w, http.StatusBadRequest, "自定义 Client ID 需为 2-63 位字母、数字、点、下划线或连字符")
+			return
+		}
+		if _, err := s.store.GetOAuthClient(customID); err == nil {
+			writeAPIError(w, http.StatusConflict, "该 Client ID 已存在，请更换标识")
+			return
+		}
+	}
+
 	uris, err := validateClientInput(req.Name, req.RedirectURIs)
 	if err != nil {
 		writeAPIError(w, http.StatusBadRequest, err.Error())
@@ -315,7 +482,7 @@ func (s *Server) handleCreateClient(w http.ResponseWriter, r *http.Request, ses 
 		}
 	}
 
-	client, err := s.store.CreateOAuthClient("", req.Name, req.Description, secretHash, uris, req.Trusted, req.PKCERequired, req.IsPublic)
+	client, err := s.store.CreateOAuthClient(customID, req.Name, req.Description, secretHash, uris, req.Trusted, req.PKCERequired, req.IsPublic)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "保存应用失败")
 		return
@@ -427,7 +594,15 @@ func (s *Server) handleListAudit(w http.ResponseWriter, r *http.Request, ses *st
 	if limit <= 0 {
 		limit = 20
 	}
-	logs, total, err := s.store.ListAuditLogs(limit, offset)
+
+	filter := store.AuditFilter{
+		Status:   strings.TrimSpace(q.Get("status")),
+		Category: strings.TrimSpace(q.Get("category")),
+		Query:    strings.TrimSpace(q.Get("q")),
+		Limit:    limit,
+		Offset:   offset,
+	}
+	logs, total, err := s.store.ListAuditLogsFiltered(filter)
 	if err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "读取审计日志失败")
 		return

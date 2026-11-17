@@ -15,6 +15,9 @@ import (
 	"github.com/YN1753/vesper-auth/internal/store"
 )
 
+// ErrCloneWarning indicates a WebAuthn authenticator reported an anomalous signature counter rollback.
+var ErrCloneWarning = errors.New("authenticator clone warning detected")
+
 // WebAuthnUser adapts store.AdminUser and its registered Passkey credentials to webauthn.User.
 type WebAuthnUser struct {
 	User        *store.AdminUser
@@ -158,7 +161,7 @@ func (pm *PasskeyManager) FinishRegistration(user *store.AdminUser, ceremonyID s
 	return pm.store.CreatePasskey(user.ID, st.deviceName, cred.ID, string(credJSON), aaguid, cred.Authenticator.SignCount)
 }
 
-// BeginLogin starts a discoverable (passwordless) Passkey authentication ceremony.
+// BeginLogin starts a modal discoverable (passwordless) Passkey authentication ceremony.
 func (pm *PasskeyManager) BeginLogin() (string, *protocol.CredentialAssertion, error) {
 	assertion, session, err := pm.wa.BeginDiscoverableLogin()
 	if err != nil {
@@ -175,7 +178,24 @@ func (pm *PasskeyManager) BeginLogin() (string, *protocol.CredentialAssertion, e
 	return cid, assertion, nil
 }
 
-// FinishLogin verifies a Passkey assertion and updates credential sign count.
+// BeginConditionalLogin starts a WebAuthn Conditional UI ceremony for input autofill mediation.
+func (pm *PasskeyManager) BeginConditionalLogin() (string, *protocol.CredentialAssertion, error) {
+	assertion, session, err := pm.wa.BeginDiscoverableMediatedLogin(protocol.MediationConditional)
+	if err != nil {
+		return "", nil, err
+	}
+	cid, err := store.RandomHex(16)
+	if err != nil {
+		return "", nil, err
+	}
+	pm.putCeremony(cid, &ceremonyState{
+		session:   session,
+		expiresAt: time.Now().Add(10 * time.Minute),
+	})
+	return cid, assertion, nil
+}
+
+// FinishLogin verifies a Passkey assertion, rejects cloned authenticators, and updates sign count.
 func (pm *PasskeyManager) FinishLogin(ceremonyID string, r *http.Request) (*store.AdminUser, *webauthn.Credential, error) {
 	st, ok := pm.popCeremony(ceremonyID)
 	if !ok {
@@ -206,12 +226,74 @@ func (pm *PasskeyManager) FinishLogin(ceremonyID string, r *http.Request) (*stor
 		return nil, nil, errors.New("matched user missing")
 	}
 
+	if err := CheckCloneWarning(cred); err != nil {
+		return matchedUser, cred, err
+	}
+
 	if cred != nil {
 		if credJSON, mErr := json.Marshal(cred); mErr == nil {
 			_ = pm.store.UpdatePasskeyCredential(cred.ID, string(credJSON), cred.Authenticator.SignCount)
 		}
 	}
 	return matchedUser, cred, nil
+}
+
+// BeginSudoAssertion starts a re-authentication ceremony restricted to user's bound Passkeys.
+func (pm *PasskeyManager) BeginSudoAssertion(user *store.AdminUser) (string, *protocol.CredentialAssertion, error) {
+	waUser, err := pm.LoadWebAuthnUser(user)
+	if err != nil {
+		return "", nil, err
+	}
+	if len(waUser.Credentials) == 0 {
+		return "", nil, errors.New("当前账号尚未绑定 Passkey，请使用主密码完成验证")
+	}
+	assertion, session, err := pm.wa.BeginLogin(waUser)
+	if err != nil {
+		return "", nil, err
+	}
+	cid, err := store.RandomHex(16)
+	if err != nil {
+		return "", nil, err
+	}
+	pm.putCeremony(cid, &ceremonyState{
+		session:   session,
+		userID:    user.ID,
+		expiresAt: time.Now().Add(5 * time.Minute),
+	})
+	return cid, assertion, nil
+}
+
+// FinishSudoAssertion completes Passkey re-authentication for Sudo Mode elevation.
+func (pm *PasskeyManager) FinishSudoAssertion(user *store.AdminUser, ceremonyID string, r *http.Request) error {
+	st, ok := pm.popCeremony(ceremonyID)
+	if !ok || st.userID != user.ID {
+		return errors.New("验证挑战已过期，请重试")
+	}
+	waUser, err := pm.LoadWebAuthnUser(user)
+	if err != nil {
+		return err
+	}
+	cred, err := pm.wa.FinishLogin(waUser, *st.session, r)
+	if err != nil {
+		return err
+	}
+	if err := CheckCloneWarning(cred); err != nil {
+		return err
+	}
+	if cred != nil {
+		if credJSON, mErr := json.Marshal(cred); mErr == nil {
+			_ = pm.store.UpdatePasskeyCredential(cred.ID, string(credJSON), cred.Authenticator.SignCount)
+		}
+	}
+	return nil
+}
+
+// CheckCloneWarning returns ErrCloneWarning if the authenticator reported a cloned signature counter.
+func CheckCloneWarning(cred *webauthn.Credential) error {
+	if cred != nil && cred.Authenticator.CloneWarning {
+		return ErrCloneWarning
+	}
+	return nil
 }
 
 func (pm *PasskeyManager) putCeremony(id string, st *ceremonyState) {

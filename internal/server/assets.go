@@ -1,40 +1,87 @@
 package server
 
 import (
-	"encoding/json"
+	"crypto/sha256"
+	"encoding/hex"
 	"html/template"
 	"io/fs"
 	"net/http"
+	"strings"
 
 	"github.com/YN1753/vesper-auth/internal/oidc"
 	"github.com/YN1753/vesper-auth/web"
 )
 
-// Renderer renders embedded HTML templates and serves embedded static files.
+// Renderer renders embedded HTML templates and serves content-fingerprinted static files.
 type Renderer struct {
-	templates *template.Template
-	staticFS  http.Handler
+	templates   *template.Template
+	staticFS    http.Handler
+	assetHashes map[string]string
 }
 
-// NewRenderer parses embedded HTML templates and prepares the static asset handler.
+// NewRenderer computes SHA-256 fingerprints for embedded static files and parses HTML templates.
 func NewRenderer() (*Renderer, error) {
-	tmpl, err := template.ParseFS(web.FS, "templates/*.html")
+	hashes := make(map[string]string)
+	err := fs.WalkDir(web.FS, "static", func(path string, d fs.DirEntry, err error) error {
+		if err != nil || d.IsDir() {
+			return err
+		}
+		raw, rErr := fs.ReadFile(web.FS, path)
+		if rErr != nil {
+			return rErr
+		}
+		sum := sha256.Sum256(raw)
+		urlPath := "/" + strings.TrimLeft(path, "/")
+		hashes[urlPath] = hex.EncodeToString(sum[:])[:10]
+		return nil
+	})
 	if err != nil {
 		return nil, err
 	}
+
 	sub, err := fs.Sub(web.FS, "static")
 	if err != nil {
 		return nil, err
 	}
-	return &Renderer{
-		templates: tmpl,
-		staticFS:  http.FileServer(http.FS(sub)),
-	}, nil
+
+	r := &Renderer{
+		staticFS:    http.FileServer(http.FS(sub)),
+		assetHashes: hashes,
+	}
+
+	tmpl, err := template.New("").Funcs(template.FuncMap{
+		"asset": r.AssetURL,
+	}).ParseFS(web.FS, "templates/*.html")
+	if err != nil {
+		return nil, err
+	}
+	r.templates = tmpl
+	return r, nil
 }
 
-// StaticHandler serves /static/* assets from embed.FS.
+// AssetURL appends the embedded content hash query parameter to a /static/ path.
+func (r *Renderer) AssetURL(urlPath string) string {
+	if h, ok := r.assetHashes[urlPath]; ok {
+		return urlPath + "?v=" + h
+	}
+	return urlPath
+}
+
+// StaticHandler serves /static/* assets with immutable caching when ?v= matches the content hash.
 func (r *Renderer) StaticHandler() http.Handler {
-	return http.StripPrefix("/static/", r.staticFS)
+	stripped := http.StripPrefix("/static/", r.staticFS)
+	return http.HandlerFunc(func(w http.ResponseWriter, req *http.Request) {
+		expectedHash, ok := r.assetHashes[req.URL.Path]
+		if ok {
+			w.Header().Set("ETag", `"`+expectedHash+`"`)
+			if v := req.URL.Query().Get("v"); v != "" && v == expectedHash {
+				w.Header().Set("Cache-Control", "public, max-age=31536000, immutable")
+			} else {
+				w.Header().Set("Cache-Control", "public, max-age=60")
+			}
+		}
+		stripped.ServeHTTP(w, req)
+	})
 }
 
 // SetupViewData supplies template data for /setup.
@@ -49,18 +96,19 @@ type LoginViewData struct {
 	IssuerHost    string
 	PendingClient string
 	LoggedOut     bool
-	ReqIDJSON     template.JS
-	NextURLJSON   template.JS
+	Reauth        bool
+	ReqID         string
+	NextURL       string
 }
 
 // AdminViewData supplies template data for /.
 type AdminViewData struct {
-	Issuer        string
-	Username      string
-	Email         string
-	DisplayName   string
-	IssuerJSON    template.JS
-	CSRFTokenJSON template.JS
+	Issuer      string
+	Username    string
+	Email       string
+	DisplayName string
+	CSRFToken   string
+	Version     string
 }
 
 // ErrorViewData supplies template data for error pages.
@@ -85,6 +133,11 @@ func (r *Renderer) RenderConsent(w http.ResponseWriter, data oidc.ConsentViewDat
 	r.exec(w, http.StatusOK, "consent.html", data)
 }
 
+// RenderLogoutConfirm implements oidc.TemplateRenderer for anti-CSRF OIDC logout confirmation.
+func (r *Renderer) RenderLogoutConfirm(w http.ResponseWriter, data oidc.LogoutConfirmViewData) {
+	r.exec(w, http.StatusOK, "logout.html", data)
+}
+
 // RenderError implements oidc.TemplateRenderer and renders general error screens.
 func (r *Renderer) RenderError(w http.ResponseWriter, status int, title, message string) {
 	r.exec(w, status, "error.html", ErrorViewData{
@@ -104,9 +157,4 @@ func (r *Renderer) exec(w http.ResponseWriter, status int, name string, data any
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = r.templates.ExecuteTemplate(w, name, data)
-}
-
-func toJSString(s string) template.JS {
-	b, _ := json.Marshal(s)
-	return template.JS(b)
 }

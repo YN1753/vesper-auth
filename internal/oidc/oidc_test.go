@@ -30,7 +30,6 @@ func TestKeySetPersistenceAndJWKS(t *testing.T) {
 	}
 	_ = st1.Close()
 
-	// Reopen database and verify exact same RSA keypair is loaded.
 	st2, err := store.Open(dbPath)
 	if err != nil {
 		t.Fatalf("open store 2: %v", err)
@@ -47,6 +46,61 @@ func TestKeySetPersistenceAndJWKS(t *testing.T) {
 	jwks2 := ks2.JWKS()["keys"]
 	if jwks2[0].N != jwks1[0].N || jwks2[0].E != jwks1[0].E {
 		t.Fatal("JWK modulus/exponent mismatch across restart")
+	}
+}
+
+func TestKeySetZeroDowntimeRotation(t *testing.T) {
+	st, err := store.Open(":memory:")
+	if err != nil {
+		t.Fatalf("open store: %v", err)
+	}
+	defer st.Close()
+
+	ks, err := LoadOrCreateKeySet(st)
+	if err != nil {
+		t.Fatalf("LoadOrCreateKeySet: %v", err)
+	}
+	kid1 := ks.Active().KID
+
+	user := &store.AdminUser{ID: "usr_1", Username: "starry", Email: "starry@starryheavens.uk"}
+	issuer := "https://auth.starryheavens.uk"
+
+	// Sign access token with key 1 before rotation.
+	tokBefore, _, err := SignAccessToken(ks, issuer, "nezha", "jti_old", "openid", user, time.Hour)
+	if err != nil {
+		t.Fatalf("SignAccessToken before rotate: %v", err)
+	}
+
+	// Rotate to key 2 retaining up to 2 keys.
+	rk2, err := ks.Rotate(st, 2)
+	if err != nil {
+		t.Fatalf("Rotate 1: %v", err)
+	}
+	if rk2.KID == kid1 || ks.Active().KID != rk2.KID {
+		t.Fatal("expected active KID to switch to rotated key")
+	}
+	if len(ks.JWKS()["keys"]) != 2 {
+		t.Fatalf("expected 2 keys in JWKS during grace period, got %d", len(ks.JWKS()["keys"]))
+	}
+
+	// Pre-rotation token must still verify seamlessly!
+	if _, err := VerifyAccessToken(ks, issuer, tokBefore); err != nil {
+		t.Fatalf("token signed prior to rotation failed verification: %v", err)
+	}
+
+	// Rotate again with retainCount=2 -> key 1 is pruned, key 2 and key 3 remain.
+	rk3, err := ks.Rotate(st, 2)
+	if err != nil {
+		t.Fatalf("Rotate 2: %v", err)
+	}
+	if len(ks.JWKS()["keys"]) != 2 {
+		t.Fatalf("expected retainCount=2 to prune oldest key, got %d", len(ks.JWKS()["keys"]))
+	}
+	if _, ok := ks.Lookup(kid1); ok {
+		t.Fatal("expected oldest key kid1 to be pruned after exceeding retainCount=2")
+	}
+	if _, ok := ks.Lookup(rk2.KID); !ok || ks.Active().KID != rk3.KID {
+		t.Fatal("expected rk2 retained and rk3 active")
 	}
 }
 
@@ -80,7 +134,6 @@ func TestRS256IDTokenSigningAndJWKVerification(t *testing.T) {
 		t.Fatalf("SignIDToken: %v", err)
 	}
 
-	// Reconstruct RSA public key purely from JWKS JSON representation (like a relying party).
 	jwk := ks.JWKS()["keys"][0]
 	nBytes, err := base64.RawURLEncoding.DecodeString(jwk.N)
 	if err != nil {
@@ -129,5 +182,31 @@ func TestPKCES256Verification(t *testing.T) {
 	}
 	if VerifyPKCE(challenge, "S256", "too-short") {
 		t.Fatal("expected short code_verifier to fail")
+	}
+}
+
+func TestLoopbackDynamicPortMatching(t *testing.T) {
+	pubClient := &store.OAuthClient{
+		ID:           "bothub-cli",
+		IsPublic:     true,
+		RedirectURIs: []string{"http://127.0.0.1/oauth/callback", "http://[::1]/oauth/callback"},
+	}
+	confClient := &store.OAuthClient{
+		ID:           "web-app",
+		IsPublic:     false,
+		RedirectURIs: []string{"http://127.0.0.1/oauth/callback"},
+	}
+
+	if !IsRedirectURIAllowed(pubClient, "http://127.0.0.1:53812/oauth/callback") {
+		t.Fatal("expected dynamic port on 127.0.0.1 for public client to be allowed")
+	}
+	if !IsRedirectURIAllowed(pubClient, "http://[::1]:49152/oauth/callback") {
+		t.Fatal("expected dynamic port on [::1] for public client to be allowed")
+	}
+	if IsRedirectURIAllowed(pubClient, "http://127.0.0.1:53812/evil/path") {
+		t.Fatal("expected path mismatch on loopback to be rejected")
+	}
+	if IsRedirectURIAllowed(confClient, "http://127.0.0.1:53812/oauth/callback") {
+		t.Fatal("expected confidential client to require exact port match")
 	}
 }

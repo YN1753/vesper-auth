@@ -4,7 +4,7 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>授权确认 - Vesper Auth</title>
-  <link rel="stylesheet" href="/static/css/vesper.css">
+  <link rel="stylesheet" href="{{asset "/static/css/vesper.css"}}">
 </head>
 <body>
   <main class="auth-viewport">
@@ -26,15 +26,15 @@
         应用 <strong>{{.ClientName}}</strong> 正在请求通过 Vesper Auth 登录并获取以下权限：
       </p>
 
-      <div class="kv-table" style="margin-bottom: 16px;">
+      <div class="kv-table mb-md">
         <div class="kv-row">
-          <div>
+          <div class="kv-cell">
             <div class="kv-key">回调目标域名</div>
             <div class="kv-val">{{.CallbackHost}}</div>
           </div>
         </div>
         <div class="kv-row">
-          <div>
+          <div class="kv-cell">
             <div class="kv-key">完整回调地址 (redirect_uri)</div>
             <div class="kv-val">{{.RedirectURI}}</div>
           </div>

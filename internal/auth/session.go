@@ -2,7 +2,6 @@ package auth
 
 import (
 	"crypto/hmac"
-	"crypto/rand"
 	"crypto/sha256"
 	"crypto/subtle"
 	"encoding/hex"
@@ -15,18 +14,19 @@ import (
 
 const SessionCookieName = "vesper_session"
 
-// SessionManager manages browser authentication cookies and per-session CSRF tokens.
+// SessionManager manages browser authentication cookies and persistent per-session CSRF tokens.
 type SessionManager struct {
-	store        *store.Store
-	ttl          time.Duration
-	cookieSecure bool
-	csrfSecret   []byte
+	store             *store.Store
+	ttl               time.Duration
+	cookieSecure      bool
+	csrfSecret        []byte
+	trustedProxyCheck func(*http.Request) bool
 }
 
-// NewSessionManager creates a SessionManager with an ephemeral HMAC key for CSRF derivation.
+// NewSessionManager creates a SessionManager backed by a persistent SQLite HMAC key for CSRF derivation.
 func NewSessionManager(st *store.Store, ttl time.Duration, cookieSecure bool) (*SessionManager, error) {
-	secret := make([]byte, 32)
-	if _, err := rand.Read(secret); err != nil {
+	secret, err := st.GetOrCreateCSRFSecret()
+	if err != nil {
 		return nil, err
 	}
 	return &SessionManager{
@@ -35,6 +35,11 @@ func NewSessionManager(st *store.Store, ttl time.Duration, cookieSecure bool) (*
 		cookieSecure: cookieSecure,
 		csrfSecret:   secret,
 	}, nil
+}
+
+// SetTrustedProxyCheck restricts when X-Forwarded-Proto headers are trusted for Secure cookie detection.
+func (m *SessionManager) SetTrustedProxyCheck(fn func(*http.Request) bool) {
+	m.trustedProxyCheck = fn
 }
 
 // Issue creates a persistent session and sets the HttpOnly session cookie on w.
@@ -49,7 +54,7 @@ func (m *SessionManager) Issue(w http.ResponseWriter, r *http.Request, userID, i
 		Path:     "/",
 		MaxAge:   int(m.ttl.Seconds()),
 		HttpOnly: true,
-		Secure:   m.isSecure(r),
+		Secure:   m.IsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 	return ses, nil
@@ -84,7 +89,7 @@ func (m *SessionManager) Clear(w http.ResponseWriter, r *http.Request) {
 		MaxAge:   -1,
 		Expires:  time.Unix(0, 0),
 		HttpOnly: true,
-		Secure:   m.isSecure(r),
+		Secure:   m.IsHTTPS(r),
 		SameSite: http.SameSiteLaxMode,
 	})
 }
@@ -105,7 +110,8 @@ func (m *SessionManager) VerifyCSRF(sessionID, token string) bool {
 	return subtle.ConstantTimeCompare([]byte(expected), []byte(token)) == 1
 }
 
-func (m *SessionManager) isSecure(r *http.Request) bool {
+// IsHTTPS reports whether cookies/headers should assume HTTPS transport.
+func (m *SessionManager) IsHTTPS(r *http.Request) bool {
 	if m.cookieSecure {
 		return true
 	}
@@ -113,10 +119,12 @@ func (m *SessionManager) isSecure(r *http.Request) bool {
 		if r.TLS != nil {
 			return true
 		}
-		if xfp := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xfp != "" {
-			first := strings.TrimSpace(strings.Split(xfp, ",")[0])
-			if strings.EqualFold(first, "https") {
-				return true
+		if m.trustedProxyCheck == nil || m.trustedProxyCheck(r) {
+			if xfp := strings.TrimSpace(r.Header.Get("X-Forwarded-Proto")); xfp != "" {
+				first := strings.TrimSpace(strings.Split(xfp, ",")[0])
+				if strings.EqualFold(first, "https") {
+					return true
+				}
 			}
 		}
 	}

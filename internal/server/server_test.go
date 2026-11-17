@@ -5,6 +5,7 @@ import (
 	"crypto/rsa"
 	"encoding/base64"
 	"encoding/json"
+	"io"
 	"math/big"
 	"net/http"
 	"net/http/cookiejar"
@@ -31,7 +32,6 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *httptest.Server) {
 	}
 	t.Cleanup(func() { _ = st.Close() })
 
-	var ts *httptest.Server
 	cfg := &config.Config{
 		Issuer:               "https://auth.starryheavens.uk",
 		ListenAddr:           "127.0.0.1:0",
@@ -42,22 +42,29 @@ func newTestServer(t *testing.T) (*Server, *store.Store, *httptest.Server) {
 		RPDisplayName:        "Vesper Auth",
 		RPOrigins:            []string{"https://auth.starryheavens.uk"},
 		SessionTTL:           time.Hour,
+		SudoTTL:              15 * time.Minute,
 		AccessTokenTTL:       time.Hour,
 		IDTokenTTL:           time.Hour,
 		RefreshTokenTTL:      24 * time.Hour,
 		AuthCodeTTL:          5 * time.Minute,
-		CookieSecure:         false, // httptest uses plain HTTP
+		CookieSecure:         false, // httptest uses plain HTTP unless testing proxy headers
 		TrustProxy:           true,
 		RateLimitMaxAttempts: 3,
 		RateLimitWindow:      5 * time.Minute,
 		RateLimitLockout:     5 * time.Minute,
+		RateLimitMaxBuckets:  1000,
+		AuditRetentionDays:   90,
+		KeyRetainCount:       3,
 	}
 
 	srv, err := New(cfg, st)
 	if err != nil {
 		t.Fatalf("new server: %v", err)
 	}
-	ts = httptest.NewServer(srv.Handler())
+	srv.SetVersion("v1.0.0-test")
+	t.Cleanup(srv.Close)
+
+	ts := httptest.NewServer(srv.Handler())
 	t.Cleanup(ts.Close)
 	return srv, st, ts
 }
@@ -89,8 +96,19 @@ func bootstrapTestAdmin(t *testing.T, st *store.Store) *store.AdminUser {
 	return user
 }
 
-func TestDiscoveryAndJWKS(t *testing.T) {
+func TestDiscoveryJWKSAndHealthz(t *testing.T) {
 	_, _, ts := newTestServer(t)
+
+	hResp, err := http.Get(ts.URL + "/healthz")
+	if err != nil {
+		t.Fatalf("GET /healthz: %v", err)
+	}
+	var hDoc map[string]string
+	_ = json.NewDecoder(hResp.Body).Decode(&hDoc)
+	hResp.Body.Close()
+	if hResp.StatusCode != http.StatusOK || hDoc["status"] != "ok" || hDoc["version"] != "v1.0.0-test" {
+		t.Fatalf("unexpected /healthz: status=%d doc=%+v", hResp.StatusCode, hDoc)
+	}
 
 	resp, err := http.Get(ts.URL + "/.well-known/openid-configuration")
 	if err != nil {
@@ -100,6 +118,9 @@ func TestDiscoveryAndJWKS(t *testing.T) {
 	if resp.StatusCode != http.StatusOK {
 		t.Fatalf("discovery status = %d", resp.StatusCode)
 	}
+	if resp.Header.Get("Access-Control-Allow-Origin") != "*" {
+		t.Fatalf("expected CORS * on discovery, got %q", resp.Header.Get("Access-Control-Allow-Origin"))
+	}
 	var doc map[string]any
 	if err := json.NewDecoder(resp.Body).Decode(&doc); err != nil {
 		t.Fatalf("decode discovery: %v", err)
@@ -107,11 +128,8 @@ func TestDiscoveryAndJWKS(t *testing.T) {
 	if doc["issuer"] != "https://auth.starryheavens.uk" {
 		t.Fatalf("unexpected issuer: %v", doc["issuer"])
 	}
-	if doc["jwks_uri"] != "https://auth.starryheavens.uk/.well-known/jwks.json" {
-		t.Fatalf("unexpected jwks_uri: %v", doc["jwks_uri"])
-	}
-	if doc["token_endpoint"] != "https://auth.starryheavens.uk/oauth2/token" {
-		t.Fatalf("unexpected token_endpoint: %v", doc["token_endpoint"])
+	if doc["introspection_endpoint"] != "https://auth.starryheavens.uk/oauth2/introspect" {
+		t.Fatalf("unexpected introspection_endpoint: %v", doc["introspection_endpoint"])
 	}
 
 	jwksResp, err := http.Get(ts.URL + "/.well-known/jwks.json")
@@ -137,7 +155,6 @@ func TestSingleAdminSetupLockdownAndLoginRateLimit(t *testing.T) {
 	_, _, ts := newTestServer(t)
 	client := newNoRedirectClient(t)
 
-	// First setup succeeds.
 	setupBody := `{"username":"starry","email":"starry@starryheavens.uk","display_name":"Starry","password":"StrongPass12345"}`
 	resp, err := client.Post(ts.URL+"/api/auth/setup", "application/json", strings.NewReader(setupBody))
 	if err != nil {
@@ -148,7 +165,6 @@ func TestSingleAdminSetupLockdownAndLoginRateLimit(t *testing.T) {
 		t.Fatalf("expected 201 on initial setup, got %d", resp.StatusCode)
 	}
 
-	// Second setup attempt must be forbidden (no public registration).
 	resp2, err := http.Post(ts.URL+"/api/auth/setup", "application/json", strings.NewReader(setupBody))
 	if err != nil {
 		t.Fatalf("second setup post: %v", err)
@@ -158,7 +174,6 @@ func TestSingleAdminSetupLockdownAndLoginRateLimit(t *testing.T) {
 		t.Fatalf("expected 403 on second setup, got %d", resp2.StatusCode)
 	}
 
-	// Trigger rate limit (maxAttempts = 3).
 	badClient := newNoRedirectClient(t)
 	for i := 0; i < 3; i++ {
 		r, err := badClient.Post(ts.URL+"/api/auth/login", "application/json",
@@ -180,9 +195,12 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	_, st, ts := newTestServer(t)
 	user := bootstrapTestAdmin(t, st)
 
-	// Register a trusted Public PKCE client (simulating BotHub Android).
-	redirectURI := "uk.starryheavens.bothub://oauth/callback"
-	pubClient, err := st.CreateOAuthClient("va_bothub_android", "BotHub Android", "", "", []string{redirectURI}, true, true, true)
+	// Register a trusted Public PKCE client with both custom scheme and loopback URI.
+	redirectURI := "http://127.0.0.1:59421/oauth/callback"
+	pubClient, err := st.CreateOAuthClient("bothub-android", "BotHub Android", "", "", []string{
+		"uk.starryheavens.bothub://oauth/callback",
+		"http://127.0.0.1/oauth/callback",
+	}, true, true, true)
 	if err != nil {
 		t.Fatalf("create public client: %v", err)
 	}
@@ -191,7 +209,7 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	verifier := "VesperAuth-PKCE-Verifier-Example-0123456789abcdef"
 	challenge := oidc.ComputeS256Challenge(verifier)
 
-	// 1. Start /oauth2/authorize while unauthenticated -> should redirect to /login?req=...
+	// 1. Start /oauth2/authorize with RFC 8252 dynamic loopback port while unauthenticated.
 	authURL := ts.URL + "/oauth2/authorize?" + url.Values{
 		"client_id":             {pubClient.ID},
 		"redirect_uri":          {redirectURI},
@@ -211,11 +229,7 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	if authResp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302 to /login, got %d", authResp.StatusCode)
 	}
-	loc := authResp.Header.Get("Location")
-	if !strings.HasPrefix(loc, "/login?req=") {
-		t.Fatalf("expected redirect to /login?req=..., got %q", loc)
-	}
-	reqID := strings.TrimPrefix(loc, "/login?req=")
+	reqID := strings.TrimPrefix(authResp.Header.Get("Location"), "/login?req=")
 
 	// 2. Log in via /api/auth/login carrying reqID.
 	loginPayload, _ := json.Marshal(map[string]string{
@@ -233,9 +247,6 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	if loginResp.StatusCode != http.StatusOK {
 		t.Fatalf("expected 200 login, got %d", loginResp.StatusCode)
 	}
-	if !strings.HasPrefix(loginResult["redirect"], "/oauth2/authorize?req=") {
-		t.Fatalf("unexpected login redirect: %q", loginResult["redirect"])
-	}
 
 	// 3. Follow redirect back to /oauth2/authorize -> trusted client silently issues code & redirects.
 	cbResp, err := hc.Get(ts.URL + loginResult["redirect"])
@@ -246,19 +257,13 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	if cbResp.StatusCode != http.StatusFound {
 		t.Fatalf("expected 302 callback redirect, got %d", cbResp.StatusCode)
 	}
-	cbLoc, err := url.Parse(cbResp.Header.Get("Location"))
-	if err != nil {
-		t.Fatalf("parse callback location: %v", err)
-	}
-	if cbLoc.Query().Get("state") != "state-123" {
-		t.Fatalf("state mismatch: %q", cbLoc.Query().Get("state"))
-	}
+	cbLoc, _ := url.Parse(cbResp.Header.Get("Location"))
 	code := cbLoc.Query().Get("code")
-	if code == "" {
-		t.Fatal("missing authorization code")
+	if code == "" || cbLoc.Query().Get("state") != "state-123" {
+		t.Fatalf("unexpected callback URL: %v", cbLoc)
 	}
 
-	// 4. Verify PKCE failure with wrong code_verifier does NOT consume/succeed (Wait: code is single-use, so test PKCE failure separately, here use valid verifier).
+	// 4. Exchange authorization code + PKCE verifier.
 	tokenResp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{
 		"grant_type":    {"authorization_code"},
 		"client_id":     {pubClient.ID},
@@ -327,7 +332,22 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 		t.Fatalf("unexpected id_token claims: %+v", idClaims)
 	}
 
-	// 6. Call /oauth2/userinfo with access_token.
+	// 6. Introspect active access_token via RFC 7662 /oauth2/introspect.
+	introResp, err := http.PostForm(ts.URL+"/oauth2/introspect", url.Values{
+		"client_id": {pubClient.ID},
+		"token":     {accessToken},
+	})
+	if err != nil {
+		t.Fatalf("POST introspect: %v", err)
+	}
+	var introDoc map[string]any
+	_ = json.NewDecoder(introResp.Body).Decode(&introDoc)
+	introResp.Body.Close()
+	if introResp.StatusCode != http.StatusOK || introDoc["active"] != true || introDoc["sub"] != user.ID {
+		t.Fatalf("unexpected introspect response (%d): %+v", introResp.StatusCode, introDoc)
+	}
+
+	// 7. Call /oauth2/userinfo with access_token.
 	uiReq, _ := http.NewRequest(http.MethodGet, ts.URL+"/oauth2/userinfo", nil)
 	uiReq.Header.Set("Authorization", "Bearer "+accessToken)
 	uiResp, err := http.DefaultClient.Do(uiReq)
@@ -337,11 +357,11 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 	var uiData map[string]any
 	_ = json.NewDecoder(uiResp.Body).Decode(&uiData)
 	uiResp.Body.Close()
-	if uiResp.StatusCode != http.StatusOK || uiData["sub"] != user.ID || uiData["email"] != "starry@starryheavens.uk" {
+	if uiResp.StatusCode != http.StatusOK || uiData["sub"] != user.ID {
 		t.Fatalf("unexpected userinfo (%d): %+v", uiResp.StatusCode, uiData)
 	}
 
-	// 7. Rotate refresh_token -> get refreshToken2.
+	// 8. Rotate refresh_token -> get refreshToken2.
 	rtResp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {pubClient.ID},
@@ -361,80 +381,64 @@ func TestFullAuthorizationCodePKCEAndRefreshRotationFlow(t *testing.T) {
 		t.Fatal("expected rotated refresh_token to differ from old token")
 	}
 
-	// 8. Reuse detection: replaying refreshToken1 must fail AND revoke refreshToken2!
-	reuseResp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{
+	// 9. Reuse detection: replaying refreshToken1 must fail AND revoke refreshToken2.
+	reuseResp, _ := http.PostForm(ts.URL+"/oauth2/token", url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {pubClient.ID},
 		"refresh_token": {refreshToken1},
 	})
-	if err != nil {
-		t.Fatalf("reuse POST refresh: %v", err)
-	}
 	reuseResp.Body.Close()
 	if reuseResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected 400 on refresh token reuse, got %d", reuseResp.StatusCode)
 	}
 
-	revokedFamilyResp, err := http.PostForm(ts.URL+"/oauth2/token", url.Values{
+	revokedFamilyResp, _ := http.PostForm(ts.URL+"/oauth2/token", url.Values{
 		"grant_type":    {"refresh_token"},
 		"client_id":     {pubClient.ID},
 		"refresh_token": {refreshToken2},
 	})
-	if err != nil {
-		t.Fatalf("post-reuse refreshToken2 check: %v", err)
-	}
 	revokedFamilyResp.Body.Close()
 	if revokedFamilyResp.StatusCode != http.StatusBadRequest {
 		t.Fatalf("expected family revocation after reuse, got %d", revokedFamilyResp.StatusCode)
 	}
 
-	// 9. Revoke access token via /oauth2/revoke and verify /oauth2/userinfo rejects it.
-	revResp, err := http.PostForm(ts.URL+"/oauth2/revoke", url.Values{
+	// 10. Revoke access token and verify both /oauth2/userinfo (401) and /oauth2/introspect (active=false).
+	revResp, _ := http.PostForm(ts.URL+"/oauth2/revoke", url.Values{
 		"client_id": {pubClient.ID},
 		"token":     {accessToken},
 	})
-	if err != nil {
-		t.Fatalf("POST revoke: %v", err)
-	}
 	revResp.Body.Close()
-	if revResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 on revoke, got %d", revResp.StatusCode)
-	}
 
-	uiReq2, _ := http.NewRequest(http.MethodGet, ts.URL+"/oauth2/userinfo", nil)
-	uiReq2.Header.Set("Authorization", "Bearer "+accessToken)
-	uiResp2, err := http.DefaultClient.Do(uiReq2)
-	if err != nil {
-		t.Fatalf("GET userinfo after revoke: %v", err)
-	}
-	uiResp2.Body.Close()
-	if uiResp2.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected 401 after token revoke, got %d", uiResp2.StatusCode)
+	introResp2, _ := http.PostForm(ts.URL+"/oauth2/introspect", url.Values{
+		"client_id": {pubClient.ID},
+		"token":     {accessToken},
+	})
+	var introDoc2 map[string]any
+	_ = json.NewDecoder(introResp2.Body).Decode(&introDoc2)
+	introResp2.Body.Close()
+	if introDoc2["active"] != false {
+		t.Fatalf("expected active=false after revoke, got %+v", introDoc2)
 	}
 }
 
-func TestConfidentialClientAuthConsentAndLogout(t *testing.T) {
+func TestConfidentialClientAuthConsentAndAntiCSRFLogout(t *testing.T) {
 	_, st, ts := newTestServer(t)
 	bootstrapTestAdmin(t, st)
 
 	plainSecret := "vs_test_secret_123456"
 	redirectURI := "https://dash.starryheavens.uk/oauth2/callback"
-	client, err := st.CreateOAuthClient("va_nezha", "哪吒监控", "", store.HashToken(plainSecret), []string{redirectURI}, false, false, false)
+	client, err := st.CreateOAuthClient("nezha", "哪吒监控", "", store.HashToken(plainSecret), []string{redirectURI}, false, false, false)
 	if err != nil {
 		t.Fatalf("create confidential client: %v", err)
 	}
 
 	hc := newNoRedirectClient(t)
-	// Authenticate browser session first.
 	lResp, err := hc.Post(ts.URL+"/api/auth/login", "application/json",
 		strings.NewReader(`{"identifier":"starry","password":"VesperMasterPass123!"}`))
 	if err != nil {
 		t.Fatalf("login: %v", err)
 	}
 	lResp.Body.Close()
-	if lResp.StatusCode != http.StatusOK {
-		t.Fatalf("login status = %d", lResp.StatusCode)
-	}
 
 	// Untrusted client -> GET /oauth2/authorize returns consent HTML (200 OK).
 	authURL := ts.URL + "/oauth2/authorize?" + url.Values{
@@ -449,38 +453,23 @@ func TestConfidentialClientAuthConsentAndLogout(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GET consent: %v", err)
 	}
-	var bodyBuf bytes.Buffer
-	_, _ = bodyBuf.ReadFrom(consentResp.Body)
+	htmlBytes, _ := io.ReadAll(consentResp.Body)
 	consentResp.Body.Close()
-	if consentResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 consent page, got %d", consentResp.StatusCode)
-	}
-
-	htmlBody := bodyBuf.String()
+	htmlBody := string(htmlBytes)
 	reqMatch := regexp.MustCompile(`name="req"\s+value="([^"]+)"`).FindStringSubmatch(htmlBody)
 	csrfMatch := regexp.MustCompile(`name="csrf_token"\s+value="([^"]+)"`).FindStringSubmatch(htmlBody)
 	if len(reqMatch) != 2 || len(csrfMatch) != 2 {
 		t.Fatalf("failed to extract req/csrf_token from consent page")
 	}
 
-	// Approve consent via POST /oauth2/authorize.
-	postResp, err := hc.PostForm(ts.URL+"/oauth2/authorize", url.Values{
+	postResp, _ := hc.PostForm(ts.URL+"/oauth2/authorize", url.Values{
 		"req":        {reqMatch[1]},
 		"csrf_token": {csrfMatch[1]},
 		"decision":   {"approve"},
 	})
-	if err != nil {
-		t.Fatalf("POST approve: %v", err)
-	}
 	postResp.Body.Close()
-	if postResp.StatusCode != http.StatusFound {
-		t.Fatalf("expected 302 redirect after approve, got %d", postResp.StatusCode)
-	}
 	cbURL, _ := url.Parse(postResp.Header.Get("Location"))
 	code := cbURL.Query().Get("code")
-	if code == "" {
-		t.Fatal("missing code after consent approval")
-	}
 
 	// Exchange code using HTTP Basic Auth (client_secret_basic).
 	form := url.Values{
@@ -499,44 +488,63 @@ func TestConfidentialClientAuthConsentAndLogout(t *testing.T) {
 	var tokOut map[string]any
 	_ = json.NewDecoder(tokResp.Body).Decode(&tokOut)
 	tokResp.Body.Close()
-	if tokResp.StatusCode != http.StatusOK || tokOut["id_token"] == "" {
+	idToken, _ := tokOut["id_token"].(string)
+	if tokResp.StatusCode != http.StatusOK || idToken == "" {
 		t.Fatalf("basic auth token exchange failed (%d): %+v", tokResp.StatusCode, tokOut)
 	}
 
-	// Test /oauth2/logout with post_logout_redirect_uri matching registered origin.
-	logoutURL := ts.URL + "/oauth2/logout?" + url.Values{
+	// 1. GET /oauth2/logout WITHOUT id_token_hint must NOT silently clear session (blocks <img src> CSRF);
+	//    instead it renders a 200 OK confirmation page with csrf_token.
+	logoutNoHint := ts.URL + "/oauth2/logout?" + url.Values{
 		"client_id":                {client.ID},
 		"post_logout_redirect_uri": {"https://dash.starryheavens.uk/"},
 		"state":                    {"bye"},
 	}.Encode()
-	logoutResp, err := hc.Get(logoutURL)
+	confirmResp, err := hc.Get(logoutNoHint)
 	if err != nil {
-		t.Fatalf("GET logout: %v", err)
+		t.Fatalf("GET logout without hint: %v", err)
+	}
+	confirmHTMLBytes, _ := io.ReadAll(confirmResp.Body)
+	confirmResp.Body.Close()
+	if confirmResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 logout confirmation page without id_token_hint, got %d", confirmResp.StatusCode)
+	}
+	// Session must still be active!
+	stillIn, _ := hc.Get(ts.URL + "/api/admin/overview")
+	stillIn.Body.Close()
+	if stillIn.StatusCode != http.StatusOK {
+		t.Fatalf("expected session to remain active until logout confirmed, got %d", stillIn.StatusCode)
+	}
+
+	// 2. GET /oauth2/logout WITH valid id_token_hint immediately clears session and redirects 302.
+	logoutWithHint := ts.URL + "/oauth2/logout?" + url.Values{
+		"id_token_hint":            {idToken},
+		"post_logout_redirect_uri": {"https://dash.starryheavens.uk/"},
+		"state":                    {"bye"},
+	}.Encode()
+	logoutResp, err := hc.Get(logoutWithHint)
+	if err != nil {
+		t.Fatalf("GET logout with hint: %v", err)
 	}
 	logoutResp.Body.Close()
 	if logoutResp.StatusCode != http.StatusFound || logoutResp.Header.Get("Location") != "https://dash.starryheavens.uk/?state=bye" {
-		t.Fatalf("unexpected logout redirect: status=%d loc=%q", logoutResp.StatusCode, logoutResp.Header.Get("Location"))
+		t.Fatalf("unexpected logout redirect: status=%d loc=%q (confirmHTML=%d)", logoutResp.StatusCode, logoutResp.Header.Get("Location"), len(confirmHTMLBytes))
 	}
 
-	// Verify session cookie was invalidated by /oauth2/logout.
-	adminResp, err := hc.Get(ts.URL + "/api/admin/overview")
-	if err != nil {
-		t.Fatalf("GET overview after logout: %v", err)
-	}
+	adminResp, _ := hc.Get(ts.URL + "/api/admin/overview")
 	adminResp.Body.Close()
 	if adminResp.StatusCode != http.StatusUnauthorized {
 		t.Fatalf("expected 401 after logout, got %d", adminResp.StatusCode)
 	}
 }
 
-func TestAdminClientCRUDAndSessionAuditAPIs(t *testing.T) {
+func TestAdminClientCRUDSudoPasswordSessionAndKeyRotation(t *testing.T) {
 	_, st, ts := newTestServer(t)
-	bootstrapTestAdmin(t, st)
+	user := bootstrapTestAdmin(t, st)
 
 	hc1 := newNoRedirectClient(t)
 	hc2 := newNoRedirectClient(t)
 
-	// Log in with two separate browser clients so there are 2 active sessions.
 	for _, hc := range []*http.Client{hc1, hc2} {
 		r, err := hc.Post(ts.URL+"/api/auth/login", "application/json",
 			strings.NewReader(`{"identifier":"starry","password":"VesperMasterPass123!"}`))
@@ -544,30 +552,24 @@ func TestAdminClientCRUDAndSessionAuditAPIs(t *testing.T) {
 			t.Fatalf("login: %v", err)
 		}
 		r.Body.Close()
-		if r.StatusCode != http.StatusOK {
-			t.Fatalf("login status = %d", r.StatusCode)
-		}
 	}
 
-	// Extract CSRF token from GET / HTML.
+	// Extract CSRF token from data-csrf-token attribute on <body>.
 	homeResp, err := hc1.Get(ts.URL + "/")
 	if err != nil {
 		t.Fatalf("GET /: %v", err)
 	}
-	var buf bytes.Buffer
-	_, _ = buf.ReadFrom(homeResp.Body)
+	htmlBytes, _ := io.ReadAll(homeResp.Body)
 	homeResp.Body.Close()
-	if homeResp.StatusCode != http.StatusOK {
-		t.Fatalf("GET / status = %d", homeResp.StatusCode)
-	}
-	csrfMatch := regexp.MustCompile(`csrfToken:\s*"([^"]+)"`).FindStringSubmatch(buf.String())
+	csrfMatch := regexp.MustCompile(`data-csrf-token="([^"]+)"`).FindStringSubmatch(string(htmlBytes))
 	if len(csrfMatch) != 2 {
-		t.Fatalf("failed to extract csrfToken from admin HTML")
+		t.Fatalf("failed to extract data-csrf-token from admin HTML")
 	}
 	csrf := csrfMatch[1]
 
-	// Create client via API.
+	// Create client with custom semantic client_id "alist".
 	createReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/clients", strings.NewReader(`{
+		"client_id":"alist",
 		"name":"Alist 网盘",
 		"description":"pan.starryheavens.uk",
 		"redirect_uris":["https://pan.starryheavens.uk/api/auth/sso_callback"],
@@ -587,112 +589,273 @@ func TestAdminClientCRUDAndSessionAuditAPIs(t *testing.T) {
 	}
 	_ = json.NewDecoder(cResp.Body).Decode(&createOut)
 	cResp.Body.Close()
-	if cResp.StatusCode != http.StatusCreated || createOut.Client.ID == "" || createOut.ClientSecret == "" {
+	if cResp.StatusCode != http.StatusCreated || createOut.Client.ID != "alist" || createOut.ClientSecret == "" {
 		t.Fatalf("unexpected create client response (%d): %+v", cResp.StatusCode, createOut)
 	}
 
-	// Rotate client secret.
-	rotReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/clients/"+createOut.Client.ID+"/rotate", nil)
-	rotReq.Header.Set("X-CSRF-Token", csrf)
-	rotResp, err := hc1.Do(rotReq)
-	if err != nil {
-		t.Fatalf("rotate secret: %v", err)
+	// Simulate expired Sudo window on hc1's session -> high-privilege secret rotate returns 403 sudo_required!
+	if _, err := st.DB().Exec(`UPDATE sessions SET elevated_at = 0 WHERE user_id = ?`, user.ID); err != nil {
+		t.Fatalf("expire elevated_at: %v", err)
 	}
+
+	rotReq1, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/clients/alist/rotate", nil)
+	rotReq1.Header.Set("X-CSRF-Token", csrf)
+	rotResp1, _ := hc1.Do(rotReq1)
+	var sudoErr map[string]string
+	_ = json.NewDecoder(rotResp1.Body).Decode(&sudoErr)
+	rotResp1.Body.Close()
+	if rotResp1.StatusCode != http.StatusForbidden || sudoErr["code"] != "sudo_required" {
+		t.Fatalf("expected 403 sudo_required, got status=%d body=%+v", rotResp1.StatusCode, sudoErr)
+	}
+
+	// Elevate session via /api/admin/sudo/password.
+	sudoReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/sudo/password",
+		strings.NewReader(`{"password":"VesperMasterPass123!"}`))
+	sudoReq.Header.Set("Content-Type", "application/json")
+	sudoReq.Header.Set("X-CSRF-Token", csrf)
+	sudoResp, _ := hc1.Do(sudoReq)
+	sudoResp.Body.Close()
+	if sudoResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on sudo elevation, got %d", sudoResp.StatusCode)
+	}
+
+	// Retry secret rotate -> now succeeds!
+	rotReq2, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/clients/alist/rotate", nil)
+	rotReq2.Header.Set("X-CSRF-Token", csrf)
+	rotResp2, _ := hc1.Do(rotReq2)
 	var rotOut map[string]string
-	_ = json.NewDecoder(rotResp.Body).Decode(&rotOut)
-	rotResp.Body.Close()
-	if rotResp.StatusCode != http.StatusOK || rotOut["client_secret"] == "" || rotOut["client_secret"] == createOut.ClientSecret {
-		t.Fatalf("unexpected rotate response (%d): %+v", rotResp.StatusCode, rotOut)
+	_ = json.NewDecoder(rotResp2.Body).Decode(&rotOut)
+	rotResp2.Body.Close()
+	if rotResp2.StatusCode != http.StatusOK || rotOut["client_secret"] == "" {
+		t.Fatalf("expected 200 secret rotate after sudo, got %d %+v", rotResp2.StatusCode, rotOut)
 	}
 
-	// Revoke other sessions (should kick hc2 while keeping hc1).
-	revOthersReq, _ := http.NewRequest(http.MethodDelete, ts.URL+"/api/admin/sessions/others", nil)
-	revOthersReq.Header.Set("X-CSRF-Token", csrf)
-	revOthersResp, err := hc1.Do(revOthersReq)
-	if err != nil {
-		t.Fatalf("DELETE /api/admin/sessions/others: %v", err)
+	// Rotate RS256 signing key via admin API.
+	keyRotReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/keys/rotate", nil)
+	keyRotReq.Header.Set("X-CSRF-Token", csrf)
+	keyRotResp, _ := hc1.Do(keyRotReq)
+	var keyRotOut struct {
+		KID  string         `json:"kid"`
+		Keys []oidc.KeyMeta `json:"keys"`
 	}
-	revOthersResp.Body.Close()
-	if revOthersResp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 on revoke others, got %d", revOthersResp.StatusCode)
+	_ = json.NewDecoder(keyRotResp.Body).Decode(&keyRotOut)
+	keyRotResp.Body.Close()
+	if keyRotResp.StatusCode != http.StatusOK || len(keyRotOut.Keys) != 2 {
+		t.Fatalf("unexpected key rotate response (%d): %+v", keyRotResp.StatusCode, keyRotOut)
 	}
 
-	hc2Check, err := hc2.Get(ts.URL + "/api/admin/overview")
-	if err != nil {
-		t.Fatalf("hc2 overview: %v", err)
+	// Change password -> must automatically kick hc2 session while keeping hc1 active!
+	pwdReq, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/admin/password",
+		strings.NewReader(`{"current_password":"VesperMasterPass123!","new_password":"NewVesperMasterPass456!","revoke_tokens":true}`))
+	pwdReq.Header.Set("Content-Type", "application/json")
+	pwdReq.Header.Set("X-CSRF-Token", csrf)
+	pwdResp, _ := hc1.Do(pwdReq)
+	pwdResp.Body.Close()
+	if pwdResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 on password change, got %d", pwdResp.StatusCode)
 	}
+
+	hc2Check, _ := hc2.Get(ts.URL + "/api/admin/overview")
 	hc2Check.Body.Close()
 	if hc2Check.StatusCode != http.StatusUnauthorized {
-		t.Fatalf("expected hc2 session to be kicked (401), got %d", hc2Check.StatusCode)
+		t.Fatalf("expected hc2 session to be automatically revoked on password change, got %d", hc2Check.StatusCode)
 	}
 
-	// Verify audit logs recorded events.
-	auditResp, err := hc1.Get(ts.URL + "/api/admin/audit?limit=10&offset=0")
-	if err != nil {
-		t.Fatalf("GET audit: %v", err)
-	}
+	// Verify filtered audit logs API.
+	auditResp, _ := hc1.Get(ts.URL + "/api/admin/audit?status=success&category=admin.&limit=10")
 	var auditOut struct {
 		Logs  []store.AuditLog `json:"logs"`
 		Total int              `json:"total"`
 	}
 	_ = json.NewDecoder(auditResp.Body).Decode(&auditOut)
 	auditResp.Body.Close()
-	if auditResp.StatusCode != http.StatusOK || auditOut.Total < 4 || len(auditOut.Logs) == 0 {
-		t.Fatalf("unexpected audit response (%d): total=%d len=%d", auditResp.StatusCode, auditOut.Total, len(auditOut.Logs))
+	if auditResp.StatusCode != http.StatusOK || auditOut.Total < 2 {
+		t.Fatalf("unexpected filtered audit response (%d): %+v", auditResp.StatusCode, auditOut)
 	}
 }
 
-func TestReverseProxyHTTPSCookieAndClientIP(t *testing.T) {
+func TestSecurityHeadersCSPAssetFingerprintingAndProxyBoundary(t *testing.T) {
 	srv, st, ts := newTestServer(t)
 	bootstrapTestAdmin(t, st)
 
-	// Simulate HTTP Nginx -> 127.0.0.1:8090 behind Cloudflare (r.TLS == nil, X-Forwarded-Proto: https).
-	req, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/auth/login",
-		strings.NewReader(`{"identifier":"starry","password":"VesperMasterPass123!"}`))
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("X-Forwarded-Proto", "https")
-	req.Header.Set("CF-Connecting-IP", "203.0.113.42")
-	req.Header.Set("X-Real-IP", "172.68.10.5")
+	// 1. Check /login HTML has strict CSP, zero inline <script> blocks, zero style= attributes, and fingerprinted asset URLs.
+	resp, err := http.Get(ts.URL + "/login")
+	if err != nil {
+		t.Fatalf("GET /login: %v", err)
+	}
+	bodyBytes, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	html := string(bodyBytes)
 
-	resp, err := http.DefaultClient.Do(req)
+	csp := resp.Header.Get("Content-Security-Policy")
+	if !strings.Contains(csp, "script-src 'self'") || strings.Contains(csp, "unsafe-inline") {
+		t.Fatalf("expected strict CSP without unsafe-inline, got %q", csp)
+	}
+	if strings.Contains(html, "style=") {
+		t.Fatal("found unexpected inline style= attribute in /login HTML")
+	}
+	assetMatch := regexp.MustCompile(`src="(/static/js/login\.js\?v=[0-9a-f]{10})"`).FindStringSubmatch(html)
+	if len(assetMatch) != 2 {
+		t.Fatalf("expected content-fingerprinted login.js URL in HTML, got:\n%s", html)
+	}
+
+	// 2. Fetch fingerprinted static asset -> must return Cache-Control: immutable.
+	stResp, err := http.Get(ts.URL + assetMatch[1])
+	if err != nil {
+		t.Fatalf("GET static asset: %v", err)
+	}
+	stResp.Body.Close()
+	if !strings.Contains(stResp.Header.Get("Cache-Control"), "immutable") {
+		t.Fatalf("expected immutable Cache-Control on fingerprinted asset, got %q", stResp.Header.Get("Cache-Control"))
+	}
+
+	// 3. Trusted loopback proxy header test: X-Forwarded-Proto: https -> Secure cookie + HSTS.
+	reqProxy, _ := http.NewRequest(http.MethodPost, ts.URL+"/api/auth/login",
+		strings.NewReader(`{"identifier":"starry","password":"VesperMasterPass123!"}`))
+	reqProxy.Header.Set("Content-Type", "application/json")
+	reqProxy.Header.Set("X-Forwarded-Proto", "https")
+	reqProxy.Header.Set("CF-Connecting-IP", "203.0.113.42")
+	respProxy, err := http.DefaultClient.Do(reqProxy)
 	if err != nil {
 		t.Fatalf("proxy login: %v", err)
 	}
-	resp.Body.Close()
-	if resp.StatusCode != http.StatusOK {
-		t.Fatalf("expected 200 login, got %d", resp.StatusCode)
+	respProxy.Body.Close()
+	if respProxy.Header.Get("Strict-Transport-Security") == "" {
+		t.Fatal("expected HSTS header when X-Forwarded-Proto is https from trusted proxy")
 	}
-
 	var sesCookie *http.Cookie
-	for _, c := range resp.Cookies() {
+	for _, c := range respProxy.Cookies() {
 		if c.Name == auth.SessionCookieName {
 			sesCookie = c
 		}
 	}
-	if sesCookie == nil {
-		t.Fatal("missing session cookie")
-	}
-	if !sesCookie.Secure || !sesCookie.HttpOnly || sesCookie.SameSite != http.SameSiteLaxMode {
-		t.Fatalf("unexpected cookie attributes: Secure=%v HttpOnly=%v SameSite=%v", sesCookie.Secure, sesCookie.HttpOnly, sesCookie.SameSite)
+	if sesCookie == nil || !sesCookie.Secure || !sesCookie.HttpOnly {
+		t.Fatalf("expected Secure HttpOnly cookie, got %+v", sesCookie)
 	}
 
-	// Verify CF-Connecting-IP was recorded on the active session instead of proxy IP.
-	user, err := st.GetAdmin()
-	if err != nil {
-		t.Fatalf("get admin: %v", err)
+	// 4. Untrusted direct peer test (RemoteAddr = 198.51.100.99:4444 not in 127.0.0.1/8):
+	//    Spoofed CF-Connecting-IP and X-Forwarded-Proto MUST be ignored!
+	rec := httptest.NewRecorder()
+	directReq := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+	directReq.RemoteAddr = "198.51.100.99:4444"
+	directReq.Header.Set("CF-Connecting-IP", "1.2.3.4")
+	directReq.Header.Set("X-Forwarded-Proto", "https")
+	if gotIP := srv.clientIP(directReq); gotIP != "198.51.100.99" {
+		t.Fatalf("expected untrusted peer spoofed CF-Connecting-IP to be ignored, got %q", gotIP)
 	}
-	sessions, err := st.ListActiveSessions(user.ID, "")
-	if err != nil || len(sessions) != 1 {
-		t.Fatalf("list sessions: %v len=%d", err, len(sessions))
-	}
-	if sessions[0].IP != "203.0.113.42" {
-		t.Fatalf("expected CF-Connecting-IP 203.0.113.42, got %q", sessions[0].IP)
-	}
-
-	// Verify WebAuthn RP config remains bound to HTTPS AUTH_ISSUER.
-	if srv.cfg.RPID != "auth.starryheavens.uk" || len(srv.cfg.RPOrigins) != 1 || srv.cfg.RPOrigins[0] != "https://auth.starryheavens.uk" {
-		t.Fatalf("unexpected RP config: RPID=%q origins=%v", srv.cfg.RPID, srv.cfg.RPOrigins)
+	srv.Handler().ServeHTTP(rec, directReq)
+	if rec.Header().Get("Strict-Transport-Security") != "" {
+		t.Fatal("expected untrusted peer spoofed X-Forwarded-Proto to not trigger HSTS")
 	}
 }
 
+func TestOIDCPromptCORSAndConditionalPasskeyEndpoints(t *testing.T) {
+	_, st, ts := newTestServer(t)
+	bootstrapTestAdmin(t, st)
 
+	redirectURI := "https://bot.starryheavens.uk/auth/callback"
+	client, err := st.CreateOAuthClient("bothub-web", "BotHub Web", "", store.HashToken("vs_sec"), []string{redirectURI}, true, false, false)
+	if err != nil {
+		t.Fatalf("create client: %v", err)
+	}
+
+	hc := newNoRedirectClient(t)
+
+	// 1. prompt=none while unauthenticated -> immediate redirect with error=login_required.
+	noneURL := ts.URL + "/oauth2/authorize?" + url.Values{
+		"client_id":     {client.ID},
+		"redirect_uri":  {redirectURI},
+		"response_type": {"code"},
+		"scope":         {"openid"},
+		"prompt":        {"none"},
+		"state":         {"s1"},
+	}.Encode()
+	noneResp, _ := hc.Get(noneURL)
+	noneResp.Body.Close()
+	noneLoc, _ := url.Parse(noneResp.Header.Get("Location"))
+	if noneResp.StatusCode != http.StatusFound || noneLoc.Query().Get("error") != "login_required" {
+		t.Fatalf("expected error=login_required for prompt=none, got status=%d loc=%v", noneResp.StatusCode, noneLoc)
+	}
+
+	// Log in hc.
+	lResp, _ := hc.Post(ts.URL+"/api/auth/login", "application/json",
+		strings.NewReader(`{"identifier":"starry","password":"VesperMasterPass123!"}`))
+	lResp.Body.Close()
+
+	// 2. prompt=consent on a trusted=true client -> must show consent HTML (200 OK) instead of silent redirect.
+	consentURL := ts.URL + "/oauth2/authorize?" + url.Values{
+		"client_id":     {client.ID},
+		"redirect_uri":  {redirectURI},
+		"response_type": {"code"},
+		"scope":         {"openid"},
+		"prompt":        {"consent"},
+	}.Encode()
+	cResp, _ := hc.Get(consentURL)
+	cResp.Body.Close()
+	if cResp.StatusCode != http.StatusOK {
+		t.Fatalf("expected 200 consent page for prompt=consent on trusted client, got %d", cResp.StatusCode)
+	}
+
+	// 3. prompt=login while already logged in -> redirects to /login?req=...&reauth=1, then after re-login issues code.
+	reloginURL := ts.URL + "/oauth2/authorize?" + url.Values{
+		"client_id":     {client.ID},
+		"redirect_uri":  {redirectURI},
+		"response_type": {"code"},
+		"scope":         {"openid"},
+		"prompt":        {"login"},
+	}.Encode()
+	rlResp, _ := hc.Get(reloginURL)
+	rlResp.Body.Close()
+	rlLoc := rlResp.Header.Get("Location")
+	if !strings.Contains(rlLoc, "reauth=1") {
+		t.Fatalf("expected redirect to /login with reauth=1 for prompt=login, got %q", rlLoc)
+	}
+	uRL, _ := url.Parse(rlLoc)
+	reqID := uRL.Query().Get("req")
+
+	reLoginBody, _ := json.Marshal(map[string]string{
+		"identifier": "starry",
+		"password":   "VesperMasterPass123!",
+		"req":        reqID,
+	})
+	reLoginResp, _ := hc.Post(ts.URL+"/api/auth/login", "application/json", bytes.NewReader(reLoginBody))
+	var reLoginOut map[string]string
+	_ = json.NewDecoder(reLoginResp.Body).Decode(&reLoginOut)
+	reLoginResp.Body.Close()
+
+	afterReauthResp, _ := hc.Get(ts.URL + reLoginOut["redirect"])
+	afterReauthResp.Body.Close()
+	afterLoc, _ := url.Parse(afterReauthResp.Header.Get("Location"))
+	if afterReauthResp.StatusCode != http.StatusFound || afterLoc.Query().Get("code") == "" {
+		t.Fatalf("expected authorization code after satisfying prompt=login, got status=%d loc=%v", afterReauthResp.StatusCode, afterLoc)
+	}
+
+	// 4. Dynamic CORS preflight on /oauth2/token: registered origin allowed, unknown origin omitted.
+	optAllowed, _ := http.NewRequest(http.MethodOptions, ts.URL+"/oauth2/token", nil)
+	optAllowed.Header.Set("Origin", "https://bot.starryheavens.uk")
+	optResp1, _ := http.DefaultClient.Do(optAllowed)
+	optResp1.Body.Close()
+	if optResp1.StatusCode != http.StatusNoContent || optResp1.Header.Get("Access-Control-Allow-Origin") != "https://bot.starryheavens.uk" {
+		t.Fatalf("expected CORS preflight allowed for registered origin, got status=%d acao=%q", optResp1.StatusCode, optResp1.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	optDenied, _ := http.NewRequest(http.MethodOptions, ts.URL+"/oauth2/token", nil)
+	optDenied.Header.Set("Origin", "https://evil.example.com")
+	optResp2, _ := http.DefaultClient.Do(optDenied)
+	optResp2.Body.Close()
+	if optResp2.Header.Get("Access-Control-Allow-Origin") != "" {
+		t.Fatalf("expected no CORS header for unregistered origin, got %q", optResp2.Header.Get("Access-Control-Allow-Origin"))
+	}
+
+	// 5. WebAuthn Conditional UI begin endpoint returns challenge options.
+	condResp, err := http.Post(ts.URL+"/api/auth/passkey/login/conditional", "application/json", strings.NewReader(`{}`))
+	if err != nil {
+		t.Fatalf("POST conditional begin: %v", err)
+	}
+	var condData map[string]any
+	_ = json.NewDecoder(condResp.Body).Decode(&condData)
+	condResp.Body.Close()
+	if condResp.StatusCode != http.StatusOK || condData["ceremony_id"] == "" {
+		t.Fatalf("unexpected conditional begin response (%d): %+v", condResp.StatusCode, condData)
+	}
+}

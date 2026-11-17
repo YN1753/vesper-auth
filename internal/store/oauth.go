@@ -4,12 +4,13 @@ import (
 	"database/sql"
 	"encoding/json"
 	"errors"
+	"net/url"
 	"strings"
 )
 
-// ListSigningKeys returns all persisted RSA signing keys ordered newest first.
+// ListSigningKeys returns all persisted RSA signing keys ordered active first, then newest first.
 func (s *Store) ListSigningKeys() ([]SigningKey, error) {
-	rows, err := s.db.Query(`SELECT kid, algorithm, private_pem, active, created_at FROM signing_keys ORDER BY created_at DESC`)
+	rows, err := s.rdb.Query(`SELECT kid, algorithm, private_pem, active, created_at FROM signing_keys ORDER BY active DESC, created_at DESC, rowid DESC`)
 	if err != nil {
 		return nil, err
 	}
@@ -41,9 +42,41 @@ func (s *Store) SaveSigningKey(k *SigningKey) error {
 	return err
 }
 
+// RotateSigningKey atomically activates newKey, demotes prior keys to inactive,
+// and prunes old inactive keys beyond retainCount total keys.
+func (s *Store) RotateSigningKey(newKey *SigningKey, retainCount int) error {
+	if retainCount < 1 {
+		retainCount = 2
+	}
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`UPDATE signing_keys SET active = 0`); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`INSERT INTO signing_keys (kid, algorithm, private_pem, active, created_at) VALUES (?, ?, ?, 1, ?)`,
+		newKey.KID, newKey.Algorithm, newKey.PrivatePEM, newKey.CreatedAt,
+	); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(
+		`DELETE FROM signing_keys WHERE active = 0 AND kid NOT IN (
+			SELECT kid FROM signing_keys ORDER BY active DESC, created_at DESC, rowid DESC LIMIT ?
+		)`,
+		retainCount,
+	); err != nil {
+		return err
+	}
+	return tx.Commit()
+}
+
 // ListOAuthClients returns all registered OAuth2/OIDC clients.
 func (s *Store) ListOAuthClients() ([]OAuthClient, error) {
-	rows, err := s.db.Query(
+	rows, err := s.rdb.Query(
 		`SELECT id, name, description, secret_hash, redirect_uris, trusted, pkce_required, is_public, created_at, updated_at
 		 FROM oauth_clients ORDER BY created_at DESC`,
 	)
@@ -63,9 +96,30 @@ func (s *Store) ListOAuthClients() ([]OAuthClient, error) {
 	return out, rows.Err()
 }
 
+// IsClientOriginAllowed reports whether origin (e.g. https://bot.starryheavens.uk) matches any registered redirect_uri.
+func (s *Store) IsClientOriginAllowed(origin string) bool {
+	u, err := url.Parse(strings.TrimSpace(origin))
+	if err != nil || u.Scheme == "" || u.Host == "" {
+		return false
+	}
+	clients, err := s.ListOAuthClients()
+	if err != nil {
+		return false
+	}
+	for _, c := range clients {
+		for _, raw := range c.RedirectURIs {
+			ru, pErr := url.Parse(raw)
+			if pErr == nil && strings.EqualFold(ru.Scheme, u.Scheme) && strings.EqualFold(ru.Host, u.Host) {
+				return true
+			}
+		}
+	}
+	return false
+}
+
 // GetOAuthClient returns an OAuth2 client by client_id.
 func (s *Store) GetOAuthClient(clientID string) (*OAuthClient, error) {
-	row := s.db.QueryRow(
+	row := s.rdb.QueryRow(
 		`SELECT id, name, description, secret_hash, redirect_uris, trusted, pkce_required, is_public, created_at, updated_at
 		 FROM oauth_clients WHERE id = ?`,
 		clientID,
@@ -200,7 +254,7 @@ func (s *Store) UpdateOAuthClientSecret(clientID, secretHash string) error {
 // DeleteOAuthClient deletes an OAuth2 client and cascades its codes/tokens.
 func (s *Store) DeleteOAuthClient(clientID string) (string, error) {
 	var name string
-	err := s.db.QueryRow(`SELECT name FROM oauth_clients WHERE id = ?`, clientID).Scan(&name)
+	err := s.rdb.QueryRow(`SELECT name FROM oauth_clients WHERE id = ?`, clientID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -219,27 +273,26 @@ func (s *Store) CreateAuthRequest(req *AuthRequest) error {
 	if req.CreatedAt == 0 {
 		req.CreatedAt = now
 	}
-	_, err := s.db.Exec(
-		`INSERT INTO auth_requests (id, client_id, redirect_uri, response_type, scope, state, nonce, code_challenge, code_challenge_method, expires_at, created_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		req.ID, req.ClientID, req.RedirectURI, req.ResponseType, req.Scope, req.State, req.Nonce, req.CodeChallenge, req.CodeChallengeMethod, req.ExpiresAt, req.CreatedAt,
-	)
-	if err != nil {
-		return err
+	if req.MaxAge < -1 {
+		req.MaxAge = -1
 	}
-	_, _ = s.db.Exec(`DELETE FROM auth_requests WHERE expires_at <= ?`, now)
-	return nil
+	_, err := s.db.Exec(
+		`INSERT INTO auth_requests (id, client_id, redirect_uri, response_type, scope, state, nonce, code_challenge, code_challenge_method, prompt, max_age, expires_at, created_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		req.ID, req.ClientID, req.RedirectURI, req.ResponseType, req.Scope, req.State, req.Nonce, req.CodeChallenge, req.CodeChallengeMethod, req.Prompt, req.MaxAge, req.ExpiresAt, req.CreatedAt,
+	)
+	return err
 }
 
 // GetAuthRequest retrieves an unexpired pending authorization request.
 func (s *Store) GetAuthRequest(id string) (*AuthRequest, error) {
-	row := s.db.QueryRow(
-		`SELECT id, client_id, redirect_uri, response_type, scope, state, nonce, code_challenge, code_challenge_method, expires_at, created_at
+	row := s.rdb.QueryRow(
+		`SELECT id, client_id, redirect_uri, response_type, scope, state, nonce, code_challenge, code_challenge_method, prompt, max_age, expires_at, created_at
 		 FROM auth_requests WHERE id = ? AND expires_at > ?`,
 		id, nowUnix(),
 	)
 	r := &AuthRequest{}
-	err := row.Scan(&r.ID, &r.ClientID, &r.RedirectURI, &r.ResponseType, &r.Scope, &r.State, &r.Nonce, &r.CodeChallenge, &r.CodeChallengeMethod, &r.ExpiresAt, &r.CreatedAt)
+	err := row.Scan(&r.ID, &r.ClientID, &r.RedirectURI, &r.ResponseType, &r.Scope, &r.State, &r.Nonce, &r.CodeChallenge, &r.CodeChallengeMethod, &r.Prompt, &r.MaxAge, &r.ExpiresAt, &r.CreatedAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
@@ -247,6 +300,12 @@ func (s *Store) GetAuthRequest(id string) (*AuthRequest, error) {
 		return nil, err
 	}
 	return r, nil
+}
+
+// ClearAuthRequestPrompt updates prompt on an active AuthRequest (e.g. after satisfying prompt=login).
+func (s *Store) ClearAuthRequestPrompt(id, newPrompt string) error {
+	_, err := s.db.Exec(`UPDATE auth_requests SET prompt = ? WHERE id = ?`, newPrompt, id)
+	return err
 }
 
 // DeleteAuthRequest removes a pending authorization request.
@@ -266,11 +325,7 @@ func (s *Store) CreateAuthCode(code *AuthCode) error {
 		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, 0, ?, ?)`,
 		code.CodeHash, code.ClientID, code.UserID, code.RedirectURI, code.Scope, code.Nonce, code.CodeChallenge, code.CodeChallengeMethod, code.AuthTime, code.ExpiresAt, code.CreatedAt,
 	)
-	if err != nil {
-		return err
-	}
-	_, _ = s.db.Exec(`DELETE FROM auth_codes WHERE expires_at <= ?`, now-3600)
-	return nil
+	return err
 }
 
 // ConsumeAuthCode atomically validates and marks an authorization code as used.
@@ -331,18 +386,14 @@ func (s *Store) CreateAccessToken(rec *AccessTokenRecord) error {
 		 VALUES (?, ?, ?, ?, 0, ?, ?)`,
 		rec.JTI, rec.ClientID, rec.UserID, rec.Scope, rec.ExpiresAt, rec.CreatedAt,
 	)
-	if err != nil {
-		return err
-	}
-	_, _ = s.db.Exec(`DELETE FROM access_tokens WHERE expires_at <= ?`, now-86400)
-	return nil
+	return err
 }
 
 // IsAccessTokenActive reports whether jti exists, is not revoked, and has not expired.
 func (s *Store) IsAccessTokenActive(jti string) (bool, error) {
 	var revoked int
 	var expiresAt int64
-	err := s.db.QueryRow(`SELECT revoked, expires_at FROM access_tokens WHERE jti = ?`, jti).Scan(&revoked, &expiresAt)
+	err := s.rdb.QueryRow(`SELECT revoked, expires_at FROM access_tokens WHERE jti = ?`, jti).Scan(&revoked, &expiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -350,6 +401,24 @@ func (s *Store) IsAccessTokenActive(jti string) (bool, error) {
 		return false, err
 	}
 	return revoked == 0 && expiresAt > nowUnix(), nil
+}
+
+// GetAccessTokenRecord retrieves an access token tracking record by JTI.
+func (s *Store) GetAccessTokenRecord(jti string) (*AccessTokenRecord, error) {
+	rec := &AccessTokenRecord{}
+	var revoked int
+	err := s.rdb.QueryRow(
+		`SELECT jti, client_id, user_id, scope, revoked, expires_at, created_at FROM access_tokens WHERE jti = ?`,
+		jti,
+	).Scan(&rec.JTI, &rec.ClientID, &rec.UserID, &rec.Scope, &revoked, &rec.ExpiresAt, &rec.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	rec.Revoked = revoked != 0
+	return rec, nil
 }
 
 // RevokeAccessToken marks an access token as revoked.
@@ -370,6 +439,27 @@ func (s *Store) CreateRefreshToken(rec *RefreshTokenRecord) error {
 		rec.TokenHash, rec.FamilyID, rec.ClientID, rec.UserID, rec.Scope, rec.AuthTime, rec.ExpiresAt, rec.CreatedAt,
 	)
 	return err
+}
+
+// GetRefreshTokenByRaw looks up a refresh token record by its raw token string.
+func (s *Store) GetRefreshTokenByRaw(rawToken string) (*RefreshTokenRecord, error) {
+	hash := HashToken(rawToken)
+	rec := &RefreshTokenRecord{}
+	var rotated, revoked int
+	err := s.rdb.QueryRow(
+		`SELECT token_hash, family_id, client_id, user_id, scope, auth_time, rotated, revoked, expires_at, created_at
+		 FROM refresh_tokens WHERE token_hash = ?`,
+		hash,
+	).Scan(&rec.TokenHash, &rec.FamilyID, &rec.ClientID, &rec.UserID, &rec.Scope, &rec.AuthTime, &rotated, &revoked, &rec.ExpiresAt, &rec.CreatedAt)
+	if errors.Is(err, sql.ErrNoRows) {
+		return nil, ErrNotFound
+	}
+	if err != nil {
+		return nil, err
+	}
+	rec.Rotated = rotated != 0
+	rec.Revoked = revoked != 0
+	return rec, nil
 }
 
 // RotateRefreshToken atomically validates oldRawToken, detects reuse, marks it rotated, and persists nextRec.
@@ -449,7 +539,7 @@ func (s *Store) RotateRefreshToken(oldRawToken, clientID string, nextRec *Refres
 func (s *Store) RevokeRefreshToken(rawToken, clientID string) (bool, error) {
 	hash := HashToken(rawToken)
 	var familyID, ownerClient string
-	err := s.db.QueryRow(`SELECT family_id, client_id FROM refresh_tokens WHERE token_hash = ?`, hash).Scan(&familyID, &ownerClient)
+	err := s.rdb.QueryRow(`SELECT family_id, client_id FROM refresh_tokens WHERE token_hash = ?`, hash).Scan(&familyID, &ownerClient)
 	if errors.Is(err, sql.ErrNoRows) {
 		return false, nil
 	}
@@ -463,6 +553,23 @@ func (s *Store) RevokeRefreshToken(rawToken, clientID string) (bool, error) {
 		return false, err
 	}
 	return true, nil
+}
+
+// RevokeAllUserTokens revokes all issued access and refresh tokens belonging to userID.
+func (s *Store) RevokeAllUserTokens(userID string) error {
+	tx, err := s.db.Begin()
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback() }()
+
+	if _, err := tx.Exec(`UPDATE access_tokens SET revoked = 1 WHERE user_id = ?`, userID); err != nil {
+		return err
+	}
+	if _, err := tx.Exec(`UPDATE refresh_tokens SET revoked = 1 WHERE user_id = ?`, userID); err != nil {
+		return err
+	}
+	return tx.Commit()
 }
 
 func boolToInt(b bool) int {

@@ -21,18 +21,26 @@ jobs:
         with:
           go-version-file: go.mod
 
-      - name: Run tests
-        run: go test -v ./...
+      - name: Run tests with race detector
+        run: go test -count=1 -race -v ./...
 
-      - name: Build static linux/amd64 binary
+      - name: Build static linux/amd64 and linux/arm64 binaries
         env:
           CGO_ENABLED: "0"
           GOOS: linux
-          GOARCH: amd64
         run: |
           mkdir -p dist
-          go build -trimpath -ldflags="-s -w" -o dist/vesper-auth-linux-amd64 .
-          cd dist && sha256sum vesper-auth-linux-amd64 > vesper-auth-linux-amd64.sha256
+          VERSION="${GITHUB_REF_NAME:-dev}"
+          COMMIT="$(git rev-parse --short HEAD)"
+          BUILD_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+          LDFLAGS="-s -w -X main.version=${VERSION} -X main.commit=${COMMIT} -X main.buildTime=${BUILD_TIME}"
+
+          GOARCH=amd64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/vesper-auth-linux-amd64 .
+          GOARCH=arm64 go build -trimpath -ldflags="${LDFLAGS}" -o dist/vesper-auth-linux-arm64 .
+
+          cd dist
+          sha256sum vesper-auth-linux-amd64 > vesper-auth-linux-amd64.sha256
+          sha256sum vesper-auth-linux-arm64 > vesper-auth-linux-arm64.sha256
 
       - name: Publish GitHub Release
         if: startsWith(github.ref, 'refs/tags/v')
@@ -41,4 +49,6 @@ jobs:
           files: |
             dist/vesper-auth-linux-amd64
             dist/vesper-auth-linux-amd64.sha256
+            dist/vesper-auth-linux-arm64
+            dist/vesper-auth-linux-arm64.sha256
           generate_release_notes: true

@@ -4,12 +4,12 @@
   <meta charset="UTF-8">
   <meta name="viewport" content="width=device-width, initial-scale=1.0">
   <title>控制台 - Vesper Auth</title>
-  <link rel="stylesheet" href="/static/css/vesper.css">
+  <link rel="stylesheet" href="{{asset "/static/css/vesper.css"}}">
 </head>
-<body>
+<body data-issuer="{{.Issuer}}" data-csrf-token="{{.CSRFToken}}">
   <div class="console-shell">
     <header class="glass-card topbar">
-      <div class="brand-header" style="margin-bottom: 0;">
+      <div class="brand-header brand-header-compact">
         <div class="brand-mark" aria-hidden="true">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round">
             <path d="M12 2l7 4v6c0 5-3.5 8.5-7 10-3.5-1.5-7-5-7-10V6l7-4z"/>
@@ -74,10 +74,10 @@
       </button>
     </nav>
 
-    <div id="global-secret-banner" class="alert alert-info hidden" style="justify-content: space-between; align-items: center;">
+    <div id="global-secret-banner" class="alert alert-info alert-banner hidden">
       <div>
         <strong id="secret-banner-title">新客户端密钥已生成（仅展示一次，请立即保存）</strong>
-        <div class="mono" id="secret-banner-value" style="margin-top: 4px;"></div>
+        <div class="mono mt-xs" id="secret-banner-value"></div>
       </div>
       <div class="item-actions">
         <button id="copy-banner-secret" class="btn btn-primary btn-sm" type="button">复制密钥</button>
@@ -90,7 +90,7 @@
       <div class="panel-header">
         <div>
           <h2 class="panel-title">OAuth 2.0 / OIDC 应用列表</h2>
-          <p class="panel-sub">管理个人云端基建矩阵的接入客户端，支持静默授权与 PKCE</p>
+          <p class="panel-sub">管理个人云端基建矩阵的接入客户端，支持自定义 Client ID、静默授权与 PKCE</p>
         </div>
         <button id="new-client-btn" class="btn btn-primary" type="button">
           <svg class="icon" viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round">
@@ -131,8 +131,8 @@
             <button id="register-passkey-btn" class="btn btn-primary btn-block" type="submit">绑定当前设备 Passkey</button>
           </form>
 
-          <div style="margin-top: 22px;">
-            <h3 style="margin: 0 0 12px; font-size: 0.95rem; color: var(--text-secondary);">已绑定的 Passkey</h3>
+          <div class="mt-lg">
+            <h3 class="subheading">已绑定的 Passkey</h3>
             <div id="passkeys-list" class="list-stack"></div>
           </div>
         </div>
@@ -141,11 +141,11 @@
           <div class="panel-header">
             <div>
               <h2 class="panel-title">管理员主密码与资料</h2>
-              <p class="panel-sub">主密码仅作无 Passkey 环境下的兜底登录凭证</p>
+              <p class="panel-sub">更新主密码后将自动清理其他浏览器会话</p>
             </div>
           </div>
 
-          <form id="profile-form" style="margin-bottom: 24px;">
+          <form id="profile-form" class="mb-lg">
             <div class="field">
               <label for="profile-email">管理员邮箱</label>
               <input id="profile-email" class="input" type="email" value="{{.Email}}" required>
@@ -170,9 +170,24 @@
               <label for="confirm-new-password">确认新主密码</label>
               <input id="confirm-new-password" class="input" type="password" minlength="10" required autocomplete="new-password">
             </div>
+            <label class="checkbox-row mb-md">
+              <input id="revoke-all-tokens" type="checkbox">
+              <span>同时吊销所有已签发的 OAuth2 访问令牌与刷新令牌</span>
+            </label>
             <button class="btn btn-primary btn-block" type="submit">更新主密码</button>
           </form>
         </div>
+      </div>
+
+      <div class="glass-card panel">
+        <div class="panel-header">
+          <div>
+            <h2 class="panel-title">OIDC 签名密钥管理 (RS256 JWKS)</h2>
+            <p class="panel-sub">支持零停机平滑轮换：新密钥用于签发，旧公钥继续保留在 JWKS 中验证存量令牌</p>
+          </div>
+          <button id="rotate-key-btn" class="btn btn-secondary btn-sm" type="button">平滑轮换签名密钥</button>
+        </div>
+        <div id="keys-list" class="list-stack"></div>
       </div>
     </section>
 
@@ -197,6 +212,26 @@
         </div>
         <button id="refresh-audit-btn" class="btn btn-secondary btn-sm" type="button">刷新日志</button>
       </div>
+
+      <form id="audit-filter-form" class="filter-bar">
+        <select id="audit-filter-status" class="select" aria-label="状态筛选">
+          <option value="">全部状态</option>
+          <option value="success">仅成功 (success)</option>
+          <option value="failure">仅失败告警 (failure)</option>
+        </select>
+        <select id="audit-filter-category" class="select" aria-label="事件类别筛选">
+          <option value="">全部类别</option>
+          <option value="auth.">登录与认证 (auth.*)</option>
+          <option value="passkey.">Passkey 管理 (passkey.*)</option>
+          <option value="oauth.">OAuth2 授权与令牌 (oauth.*)</option>
+          <option value="client.">客户端变更 (client.*)</option>
+          <option value="session.">会话管理 (session.*)</option>
+          <option value="admin.">安全与密钥操作 (admin.*)</option>
+        </select>
+        <input id="audit-filter-query" class="input" type="search" placeholder="搜索 IP、主体、应用名或详情...">
+        <button class="btn btn-secondary btn-sm" type="submit">筛选</button>
+      </form>
+
       <div class="table-wrap">
         <table class="audit-table">
           <thead>
@@ -213,13 +248,15 @@
         </table>
       </div>
       <div class="pagination">
-        <span id="audit-summary" class="field-hint" style="margin: 0;"></span>
+        <span id="audit-summary" class="field-hint mb-0"></span>
         <div class="item-actions">
           <button id="audit-prev-btn" class="btn btn-secondary btn-sm" type="button">上一页</button>
           <button id="audit-next-btn" class="btn btn-secondary btn-sm" type="button">下一页</button>
         </div>
       </div>
     </section>
+
+    <footer class="console-footer">Vesper Auth {{.Version}}</footer>
   </div>
 
   <!-- Modal: Create / Edit Client -->
@@ -231,6 +268,10 @@
       </div>
       <form id="client-form">
         <input type="hidden" id="client-edit-id">
+        <div id="client-custom-id-field" class="field">
+          <label for="client-custom-id">自定义 Client ID（选填，留空则自动生成 va_ 随机标识）</label>
+          <input id="client-custom-id" class="input mono" type="text" placeholder="例如：nezha / alist / bothub-android">
+        </div>
         <div class="field">
           <label for="client-name">应用名称</label>
           <input id="client-name" class="input" type="text" required placeholder="例如：哪吒监控">
@@ -256,7 +297,7 @@
           <span>强制要求 PKCE（S256）</span>
         </label>
 
-        <div class="btn-row" style="margin-top: 20px;">
+        <div class="btn-row mt-md">
           <button id="client-modal-cancel" class="btn btn-secondary" type="button">取消</button>
           <button id="client-save-btn" class="btn btn-primary" type="submit">保存应用</button>
         </div>
@@ -278,15 +319,36 @@
     </div>
   </div>
 
+  <!-- Modal: Sudo Re-authentication -->
+  <div id="sudo-modal" class="modal-backdrop hidden" role="dialog" aria-modal="true">
+    <div class="modal-card modal-card-sm">
+      <div class="modal-header">
+        <div>
+          <h3 class="panel-title">敏感操作安全验证</h3>
+          <p class="panel-sub">距离上次认证已超过免验证窗口，请确认管理员身份</p>
+        </div>
+        <button id="sudo-modal-close" class="btn btn-secondary btn-sm" type="button">取消</button>
+      </div>
+
+      <div id="sudo-alert" class="alert alert-error hidden" role="alert"></div>
+
+      <button id="sudo-passkey-btn" class="btn btn-primary btn-block" type="button">使用 Passkey 验证身份</button>
+
+      <div class="divider-toggle">
+        <form id="sudo-password-form">
+          <div class="field">
+            <label for="sudo-password">或输入管理员主密码验证</label>
+            <input id="sudo-password" class="input" type="password" required autocomplete="current-password">
+          </div>
+          <button class="btn btn-secondary btn-block" type="submit">验证主密码</button>
+        </form>
+      </div>
+    </div>
+  </div>
+
   <div id="toast" class="toast hidden" role="status"></div>
 
-  <script>
-    window.VESPER_CONFIG = {
-      issuer: {{.IssuerJSON}},
-      csrfToken: {{.CSRFTokenJSON}}
-    };
-  </script>
-  <script src="/static/js/webauthn.js?v=20261116b"></script>
-  <script src="/static/js/admin.js?v=20261116b"></script>
+  <script src="{{asset "/static/js/webauthn.js"}}"></script>
+  <script src="{{asset "/static/js/admin.js"}}"></script>
 </body>
 </html>

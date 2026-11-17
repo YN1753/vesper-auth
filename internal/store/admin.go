@@ -11,7 +11,7 @@ import (
 // HasAdmin reports whether an administrator account has already been initialized.
 func (s *Store) HasAdmin() (bool, error) {
 	var count int
-	if err := s.db.QueryRow(`SELECT COUNT(1) FROM admin_users`).Scan(&count); err != nil {
+	if err := s.rdb.QueryRow(`SELECT COUNT(1) FROM admin_users`).Scan(&count); err != nil {
 		return false, err
 	}
 	return count > 0, nil
@@ -64,7 +64,7 @@ func (s *Store) CreateAdmin(username, email, displayName, passwordHash string) (
 
 // GetAdmin returns the sole administrator account.
 func (s *Store) GetAdmin() (*AdminUser, error) {
-	row := s.db.QueryRow(
+	row := s.rdb.QueryRow(
 		`SELECT id, username, email, display_name, password_hash, webauthn_user_id, created_at, updated_at
 		 FROM admin_users LIMIT 1`,
 	)
@@ -73,7 +73,7 @@ func (s *Store) GetAdmin() (*AdminUser, error) {
 
 // GetAdminByID returns the administrator by ID.
 func (s *Store) GetAdminByID(id string) (*AdminUser, error) {
-	row := s.db.QueryRow(
+	row := s.rdb.QueryRow(
 		`SELECT id, username, email, display_name, password_hash, webauthn_user_id, created_at, updated_at
 		 FROM admin_users WHERE id = ?`, id,
 	)
@@ -83,7 +83,7 @@ func (s *Store) GetAdminByID(id string) (*AdminUser, error) {
 // GetAdminByUsernameOrEmail looks up the admin by username or email.
 func (s *Store) GetAdminByUsernameOrEmail(identifier string) (*AdminUser, error) {
 	ident := strings.TrimSpace(identifier)
-	row := s.db.QueryRow(
+	row := s.rdb.QueryRow(
 		`SELECT id, username, email, display_name, password_hash, webauthn_user_id, created_at, updated_at
 		 FROM admin_users WHERE LOWER(username) = LOWER(?) OR LOWER(email) = LOWER(?) LIMIT 1`,
 		ident, ident,
@@ -93,7 +93,7 @@ func (s *Store) GetAdminByUsernameOrEmail(identifier string) (*AdminUser, error)
 
 // GetAdminByWebAuthnID looks up the admin by WebAuthn user handle.
 func (s *Store) GetAdminByWebAuthnID(waID []byte) (*AdminUser, error) {
-	row := s.db.QueryRow(
+	row := s.rdb.QueryRow(
 		`SELECT id, username, email, display_name, password_hash, webauthn_user_id, created_at, updated_at
 		 FROM admin_users WHERE webauthn_user_id = ? LIMIT 1`,
 		waID,
@@ -147,7 +147,7 @@ func (s *Store) UpdateAdminProfile(userID, email, displayName string) error {
 
 // ListPasskeys returns all Passkey records belonging to userID ordered newest first.
 func (s *Store) ListPasskeys(userID string) ([]PasskeyRecord, error) {
-	rows, err := s.db.Query(
+	rows, err := s.rdb.Query(
 		`SELECT id, user_id, credential_id, name, credential_json, aaguid, sign_count, created_at, last_used_at
 		 FROM passkeys WHERE user_id = ? ORDER BY created_at DESC`,
 		userID,
@@ -235,7 +235,7 @@ func (s *Store) RenamePasskey(userID, passkeyID, newName string) error {
 // DeletePasskey removes a passkey by ID for userID.
 func (s *Store) DeletePasskey(userID, passkeyID string) (string, error) {
 	var name string
-	err := s.db.QueryRow(`SELECT name FROM passkeys WHERE id = ? AND user_id = ?`, passkeyID, userID).Scan(&name)
+	err := s.rdb.QueryRow(`SELECT name FROM passkeys WHERE id = ? AND user_id = ?`, passkeyID, userID).Scan(&name)
 	if errors.Is(err, sql.ErrNoRows) {
 		return "", ErrNotFound
 	}
@@ -246,6 +246,15 @@ func (s *Store) DeletePasskey(userID, passkeyID string) (string, error) {
 		return "", err
 	}
 	return name, nil
+}
+
+// DeleteAllPasskeys removes every Passkey bound to userID.
+func (s *Store) DeleteAllPasskeys(userID string) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM passkeys WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
 }
 
 // CreateSession creates a new login session and returns the raw session token plus the stored record.
@@ -260,27 +269,27 @@ func (s *Store) CreateSession(userID, ip, userAgent, authMethod string, ttlSecon
 	}
 	now := nowUnix()
 	ses := &Session{
-		ID:         "ses_" + idHex,
-		TokenHash:  HashToken(rawToken),
-		UserID:     userID,
-		IP:         ip,
-		UserAgent:  userAgent,
-		AuthMethod: authMethod,
-		CreatedAt:  now,
-		LastSeenAt: now,
-		ExpiresAt:  now + ttlSeconds,
+		ID:          "ses_" + idHex,
+		TokenHash:   HashToken(rawToken),
+		UserID:      userID,
+		IP:          ip,
+		UserAgent:   userAgent,
+		DeviceLabel: ParseUserAgentLabel(userAgent),
+		AuthMethod:  authMethod,
+		CreatedAt:   now,
+		LastSeenAt:  now,
+		ElevatedAt:  now,
+		ExpiresAt:   now + ttlSeconds,
 	}
 
 	_, err = s.db.Exec(
-		`INSERT INTO sessions (id, token_hash, user_id, ip, user_agent, auth_method, created_at, last_seen_at, expires_at)
-		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)`,
-		ses.ID, ses.TokenHash, ses.UserID, ses.IP, ses.UserAgent, ses.AuthMethod, ses.CreatedAt, ses.LastSeenAt, ses.ExpiresAt,
+		`INSERT INTO sessions (id, token_hash, user_id, ip, user_agent, auth_method, created_at, last_seen_at, elevated_at, expires_at)
+		 VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+		ses.ID, ses.TokenHash, ses.UserID, ses.IP, ses.UserAgent, ses.AuthMethod, ses.CreatedAt, ses.LastSeenAt, ses.ElevatedAt, ses.ExpiresAt,
 	)
 	if err != nil {
 		return "", nil, err
 	}
-	// Opportunistically clean up expired sessions.
-	_, _ = s.db.Exec(`DELETE FROM sessions WHERE expires_at <= ?`, now)
 	return rawToken, ses, nil
 }
 
@@ -291,19 +300,20 @@ func (s *Store) GetSessionByToken(rawToken string) (*Session, error) {
 	}
 	hash := HashToken(rawToken)
 	now := nowUnix()
-	row := s.db.QueryRow(
-		`SELECT id, token_hash, user_id, ip, user_agent, auth_method, created_at, last_seen_at, expires_at
+	row := s.rdb.QueryRow(
+		`SELECT id, token_hash, user_id, ip, user_agent, auth_method, created_at, last_seen_at, elevated_at, expires_at
 		 FROM sessions WHERE token_hash = ? AND expires_at > ?`,
 		hash, now,
 	)
 	ses := &Session{}
-	err := row.Scan(&ses.ID, &ses.TokenHash, &ses.UserID, &ses.IP, &ses.UserAgent, &ses.AuthMethod, &ses.CreatedAt, &ses.LastSeenAt, &ses.ExpiresAt)
+	err := row.Scan(&ses.ID, &ses.TokenHash, &ses.UserID, &ses.IP, &ses.UserAgent, &ses.AuthMethod, &ses.CreatedAt, &ses.LastSeenAt, &ses.ElevatedAt, &ses.ExpiresAt)
 	if errors.Is(err, sql.ErrNoRows) {
 		return nil, ErrNotFound
 	}
 	if err != nil {
 		return nil, err
 	}
+	ses.DeviceLabel = ParseUserAgentLabel(ses.UserAgent)
 	return ses, nil
 }
 
@@ -313,11 +323,24 @@ func (s *Store) TouchSession(sessionID, ip string) error {
 	return err
 }
 
+// ElevateSession updates elevated_at to now after Sudo re-authentication.
+func (s *Store) ElevateSession(userID, sessionID string) error {
+	res, err := s.db.Exec(`UPDATE sessions SET elevated_at = ? WHERE id = ? AND user_id = ?`, nowUnix(), sessionID, userID)
+	if err != nil {
+		return err
+	}
+	n, _ := res.RowsAffected()
+	if n == 0 {
+		return ErrNotFound
+	}
+	return nil
+}
+
 // ListActiveSessions lists all non-expired sessions for userID, marking currentSessionID.
 func (s *Store) ListActiveSessions(userID, currentSessionID string) ([]Session, error) {
 	now := nowUnix()
-	rows, err := s.db.Query(
-		`SELECT id, user_id, ip, user_agent, auth_method, created_at, last_seen_at, expires_at
+	rows, err := s.rdb.Query(
+		`SELECT id, user_id, ip, user_agent, auth_method, created_at, last_seen_at, elevated_at, expires_at
 		 FROM sessions WHERE user_id = ? AND expires_at > ? ORDER BY last_seen_at DESC`,
 		userID, now,
 	)
@@ -329,9 +352,10 @@ func (s *Store) ListActiveSessions(userID, currentSessionID string) ([]Session, 
 	var out []Session
 	for rows.Next() {
 		var ses Session
-		if err := rows.Scan(&ses.ID, &ses.UserID, &ses.IP, &ses.UserAgent, &ses.AuthMethod, &ses.CreatedAt, &ses.LastSeenAt, &ses.ExpiresAt); err != nil {
+		if err := rows.Scan(&ses.ID, &ses.UserID, &ses.IP, &ses.UserAgent, &ses.AuthMethod, &ses.CreatedAt, &ses.LastSeenAt, &ses.ElevatedAt, &ses.ExpiresAt); err != nil {
 			return nil, err
 		}
+		ses.DeviceLabel = ParseUserAgentLabel(ses.UserAgent)
 		ses.Current = ses.ID == currentSessionID
 		out = append(out, ses)
 	}
@@ -367,4 +391,61 @@ func (s *Store) DeleteOtherSessions(userID, keepSessionID string) (int64, error)
 		return 0, err
 	}
 	return res.RowsAffected()
+}
+
+// DeleteAllSessions revokes every browser session for userID.
+func (s *Store) DeleteAllSessions(userID string) (int64, error) {
+	res, err := s.db.Exec(`DELETE FROM sessions WHERE user_id = ?`, userID)
+	if err != nil {
+		return 0, err
+	}
+	return res.RowsAffected()
+}
+
+// ParseUserAgentLabel derives a concise OS and browser summary from a raw User-Agent string.
+func ParseUserAgentLabel(ua string) string {
+	u := strings.ToLower(strings.TrimSpace(ua))
+	if u == "" {
+		return "Unknown Client"
+	}
+
+	osName := "Unknown OS"
+	switch {
+	case strings.Contains(u, "iphone") || strings.Contains(u, "ipad") || strings.Contains(u, "ios"):
+		osName = "iOS"
+	case strings.Contains(u, "android"):
+		osName = "Android"
+	case strings.Contains(u, "macintosh") || strings.Contains(u, "mac os x"):
+		osName = "macOS"
+	case strings.Contains(u, "windows"):
+		osName = "Windows"
+	case strings.Contains(u, "linux"):
+		osName = "Linux"
+	}
+
+	browser := "Browser"
+	switch {
+	case strings.Contains(u, "edg/") || strings.Contains(u, "edga/") || strings.Contains(u, "edgios/"):
+		browser = "Edge"
+	case strings.Contains(u, "firefox/") || strings.Contains(u, "fxios/"):
+		browser = "Firefox"
+	case strings.Contains(u, "opr/") || strings.Contains(u, "opera"):
+		browser = "Opera"
+	case strings.Contains(u, "chrome/") || strings.Contains(u, "crios/"):
+		browser = "Chrome"
+	case strings.Contains(u, "safari/"):
+		browser = "Safari"
+	case strings.Contains(u, "curl/"):
+		return "curl CLI"
+	case strings.Contains(u, "go-http-client"):
+		return "Go HTTP Client"
+	}
+
+	if osName == "Unknown OS" && browser == "Browser" {
+		if len(ua) > 36 {
+			return ua[:36] + "..."
+		}
+		return ua
+	}
+	return osName + " / " + browser
 }

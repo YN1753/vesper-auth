@@ -1,12 +1,14 @@
 package server
 
 import (
+	"errors"
 	"fmt"
 	"net/http"
 	"net/url"
 	"strings"
 
 	"github.com/YN1753/vesper-auth/internal/auth"
+	"github.com/YN1753/vesper-auth/internal/store"
 )
 
 func (s *Server) handleSetupPage(w http.ResponseWriter, r *http.Request) {
@@ -90,18 +92,21 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 
 	reqID := strings.TrimSpace(r.URL.Query().Get("req"))
 	nextURL := sanitizeNextURL(r.URL.Query().Get("next"))
+	reauth := r.URL.Query().Get("reauth") == "1"
 
-	if _, _, err := s.sessions.Authenticate(r); err == nil {
-		if reqID != "" {
-			http.Redirect(w, r, "/oauth2/authorize?req="+url.QueryEscape(reqID), http.StatusFound)
+	if !reauth {
+		if _, _, err := s.sessions.Authenticate(r); err == nil {
+			if reqID != "" {
+				http.Redirect(w, r, "/oauth2/authorize?req="+url.QueryEscape(reqID), http.StatusFound)
+				return
+			}
+			if nextURL != "" {
+				http.Redirect(w, r, nextURL, http.StatusFound)
+				return
+			}
+			http.Redirect(w, r, "/", http.StatusFound)
 			return
 		}
-		if nextURL != "" {
-			http.Redirect(w, r, nextURL, http.StatusFound)
-			return
-		}
-		http.Redirect(w, r, "/", http.StatusFound)
-		return
 	}
 
 	var pendingClient string
@@ -119,8 +124,9 @@ func (s *Server) handleLoginPage(w http.ResponseWriter, r *http.Request) {
 		IssuerHost:    s.issuer.Host,
 		PendingClient: pendingClient,
 		LoggedOut:     r.URL.Query().Get("logged_out") == "1",
-		ReqIDJSON:     toJSString(reqID),
-		NextURLJSON:   toJSString(nextURL),
+		Reauth:        reauth,
+		ReqID:         reqID,
+		NextURL:       nextURL,
 	})
 }
 
@@ -167,6 +173,9 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		locked, wait := s.limiter.RecordFailure(rlKeys...)
 		_ = s.store.RecordAudit("auth.login_password", ident, ip, r.UserAgent(), "password", "unknown account", "failure")
 		if locked {
+			if s.notifier != nil {
+				s.notifier.Notify("auth.login_rate_limited", "warning", ident, ip, "password", "login brute-force lockout triggered")
+			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
 			writeAPIError(w, http.StatusTooManyRequests, "登录失败次数过多，已触发临时冷却保护")
 			return
@@ -180,6 +189,9 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 		locked, wait := s.limiter.RecordFailure(rlKeys...)
 		_ = s.store.RecordAudit("auth.login_password", user.Username, ip, r.UserAgent(), "password", "invalid password", "failure")
 		if locked {
+			if s.notifier != nil {
+				s.notifier.Notify("auth.login_rate_limited", "warning", user.Username, ip, "password", "master password brute-force lockout triggered")
+			}
 			w.Header().Set("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
 			writeAPIError(w, http.StatusTooManyRequests, "登录失败次数过多，已触发临时冷却保护")
 			return
@@ -189,10 +201,12 @@ func (s *Server) handlePasswordLogin(w http.ResponseWriter, r *http.Request) {
 	}
 
 	s.limiter.Reset(rlKeys...)
+	s.replaceBrowserSession(w, r)
 	if _, err := s.sessions.Issue(w, r, user.ID, ip, r.UserAgent(), "password"); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "创建会话失败")
 		return
 	}
+	s.satisfyAuthRequestReauth(req.ReqID)
 	_ = s.store.RecordAudit("auth.login_password", user.Username, ip, r.UserAgent(), "session", "master password login", "success")
 
 	writeJSON(w, http.StatusOK, map[string]string{
@@ -225,6 +239,31 @@ func (s *Server) handlePasskeyLoginBegin(w http.ResponseWriter, r *http.Request)
 	})
 }
 
+func (s *Server) handlePasskeyConditionalBegin(w http.ResponseWriter, r *http.Request) {
+	ip := s.clientIP(r)
+	if ok, wait := s.limiter.Check("login:ip:" + ip); !ok {
+		w.Header().Set("Retry-After", fmt.Sprintf("%d", int(wait.Seconds())+1))
+		writeAPIError(w, http.StatusTooManyRequests, "请求过于频繁")
+		return
+	}
+
+	has, err := s.store.HasAdmin()
+	if err != nil || !has {
+		writeAPIError(w, http.StatusBadRequest, "系统尚未初始化")
+		return
+	}
+
+	cid, assertion, err := s.passkeys.BeginConditionalLogin()
+	if err != nil {
+		writeAPIError(w, http.StatusInternalServerError, "无法发起条件式 Passkey 请求")
+		return
+	}
+	writeJSON(w, http.StatusOK, map[string]any{
+		"ceremony_id": cid,
+		"options":     assertion,
+	})
+}
+
 func (s *Server) handlePasskeyLoginFinish(w http.ResponseWriter, r *http.Request) {
 	ip := s.clientIP(r)
 	rlKey := "login:ip:" + ip
@@ -245,32 +284,73 @@ func (s *Server) handlePasskeyLoginFinish(w http.ResponseWriter, r *http.Request
 
 	user, _, err := s.passkeys.FinishLogin(ceremonyID, r)
 	if err != nil {
-		s.limiter.RecordFailure(rlKey)
+		if errors.Is(err, auth.ErrCloneWarning) {
+			actor := "unknown"
+			if user != nil {
+				actor = user.Username
+			}
+			_ = s.store.RecordAudit("passkey.clone_detected", actor, ip, r.UserAgent(), "passkey", "authenticator signature counter rollback detected", "failure")
+			if s.notifier != nil {
+				s.notifier.Notify("passkey.clone_detected", "critical", actor, ip, "passkey", "authenticator clone warning detected; login blocked")
+			}
+			writeAPIError(w, http.StatusForbidden, "检测到硬件密钥计数器异常回退（疑似克隆风险），本次登录已拦截")
+			return
+		}
+		if locked, _ := s.limiter.RecordFailure(rlKey); locked && s.notifier != nil {
+			s.notifier.Notify("auth.login_rate_limited", "warning", "passkey", ip, "passkey", "repeated failed passkey assertions")
+		}
 		_ = s.store.RecordAudit("auth.login_passkey", "unknown", ip, r.UserAgent(), "passkey", err.Error(), "failure")
 		writeAPIError(w, http.StatusUnauthorized, "Passkey 验证失败或凭证未绑定")
 		return
 	}
 
 	s.limiter.Reset(rlKey)
+	s.replaceBrowserSession(w, r)
 	if _, err := s.sessions.Issue(w, r, user.ID, ip, r.UserAgent(), "passkey"); err != nil {
 		writeAPIError(w, http.StatusInternalServerError, "创建会话失败")
 		return
 	}
-	_ = s.store.RecordAudit("auth.login_passkey", user.Username, ip, r.UserAgent(), "session", "WebAuthn passkey login", "success")
 
 	reqID := strings.TrimSpace(r.URL.Query().Get("req"))
+	s.satisfyAuthRequestReauth(reqID)
+	_ = s.store.RecordAudit("auth.login_passkey", user.Username, ip, r.UserAgent(), "session", "WebAuthn passkey login", "success")
+
 	writeJSON(w, http.StatusOK, map[string]string{
 		"redirect": resolveLoginRedirect(reqID, ""),
 	})
 }
 
-func (s *Server) handleLogoutAPI(w http.ResponseWriter, r *http.Request) {
-	_, user, err := s.sessions.Authenticate(r)
+func (s *Server) handleLogoutAPI(w http.ResponseWriter, r *http.Request, ses *store.Session, user *store.AdminUser) {
 	s.sessions.Clear(w, r)
-	if err == nil && user != nil {
-		_ = s.store.RecordAudit("auth.logout", user.Username, s.clientIP(r), r.UserAgent(), "session", "manual logout", "success")
-	}
+	_ = s.store.RecordAudit("auth.logout", user.Username, s.clientIP(r), r.UserAgent(), "session", "manual logout", "success")
 	writeJSON(w, http.StatusOK, map[string]string{"status": "ok"})
+}
+
+func (s *Server) replaceBrowserSession(w http.ResponseWriter, r *http.Request) {
+	if c, err := r.Cookie(auth.SessionCookieName); err == nil && c.Value != "" {
+		_ = s.store.DeleteSessionByToken(c.Value)
+	}
+}
+
+func (s *Server) satisfyAuthRequestReauth(reqID string) {
+	reqID = strings.TrimSpace(reqID)
+	if reqID == "" {
+		return
+	}
+	ar, err := s.store.GetAuthRequest(reqID)
+	if err != nil {
+		return
+	}
+	var kept []string
+	for _, p := range strings.Fields(ar.Prompt) {
+		if p != "login" {
+			kept = append(kept, p)
+		}
+	}
+	nextPrompt := strings.Join(kept, " ")
+	if nextPrompt != ar.Prompt {
+		_ = s.store.ClearAuthRequestPrompt(reqID, nextPrompt)
+	}
 }
 
 func resolveLoginRedirect(reqID, next string) string {

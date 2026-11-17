@@ -61,6 +61,82 @@ a:hover {
   word-break: break-all;
 }
 
+.mono-xs {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  word-break: break-all;
+}
+
+.mono-accent {
+  font-family: var(--font-mono);
+  font-size: 0.82rem;
+  color: var(--accent);
+  margin-bottom: 4px;
+  word-break: break-all;
+}
+
+.mono-muted {
+  font-family: var(--font-mono);
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  word-break: break-all;
+}
+
+.mono-secondary {
+  font-family: var(--font-mono);
+  font-size: 0.8rem;
+  color: var(--text-secondary);
+  word-break: break-all;
+}
+
+.nowrap {
+  white-space: nowrap;
+}
+
+.text-secondary-sm {
+  font-size: 0.84rem;
+  color: var(--text-secondary);
+  word-break: break-word;
+}
+
+.text-muted-cell {
+  color: var(--text-muted);
+}
+
+.mt-xs {
+  margin-top: 4px;
+}
+
+.mt-md {
+  margin-top: 16px;
+}
+
+.mt-lg {
+  margin-top: 22px;
+}
+
+.mb-0 {
+  margin-bottom: 0;
+}
+
+.mb-sm {
+  margin-bottom: 6px;
+}
+
+.mb-md {
+  margin-bottom: 16px;
+}
+
+.mb-lg {
+  margin-bottom: 24px;
+}
+
+.subheading {
+  margin: 0 0 12px;
+  font-size: 0.95rem;
+  color: var(--text-secondary);
+}
+
 .glass-card {
   background: var(--glass-bg);
   border: 1px solid var(--glass-border);
@@ -93,6 +169,10 @@ a:hover {
   margin-bottom: 22px;
 }
 
+.brand-header-compact {
+  margin-bottom: 0;
+}
+
 .brand-mark {
   width: 42px;
   height: 42px;
@@ -104,6 +184,12 @@ a:hover {
   border: 1px solid var(--glass-border-strong);
   color: var(--accent);
   flex-shrink: 0;
+}
+
+.brand-mark-danger {
+  color: var(--rose);
+  border-color: rgba(251, 113, 133, 0.36);
+  background: var(--rose-soft);
 }
 
 .brand-title {
@@ -126,7 +212,7 @@ a:hover {
   color: var(--text-secondary);
 }
 
-/* Controls & Buttons (min-height >= 42px for comfortable touch) */
+/* Controls & Buttons (min-height >= 40px) */
 .btn {
   display: inline-flex;
   align-items: center;
@@ -253,6 +339,12 @@ a:hover {
   color: var(--text-muted);
 }
 
+.field-hint-tight {
+  margin: 2px 0 0;
+  font-size: 0.8rem;
+  color: var(--text-muted);
+}
+
 .checkbox-row {
   display: flex;
   align-items: center;
@@ -281,6 +373,12 @@ a:hover {
   display: flex;
   align-items: flex-start;
   gap: 10px;
+}
+
+.alert-banner {
+  justify-content: space-between;
+  align-items: center;
+  flex-wrap: wrap;
 }
 
 .alert-error {
@@ -547,6 +645,14 @@ a:hover {
   margin-right: 4px;
 }
 
+.filter-bar {
+  display: grid;
+  grid-template-columns: 160px 190px minmax(180px, 1fr) auto;
+  gap: 10px;
+  margin-bottom: 16px;
+  align-items: center;
+}
+
 /* Modal */
 .modal-backdrop {
   position: fixed;
@@ -572,6 +678,10 @@ a:hover {
   box-shadow: var(--shadow-glass);
 }
 
+.modal-card-sm {
+  max-width: 440px;
+}
+
 .modal-header {
   display: flex;
   align-items: center;
@@ -595,6 +705,11 @@ a:hover {
   align-items: center;
   justify-content: space-between;
   gap: 10px;
+}
+
+.kv-cell {
+  min-width: 0;
+  flex: 1;
 }
 
 .kv-key {
@@ -645,6 +760,14 @@ a:hover {
   margin-top: 16px;
 }
 
+.console-footer {
+  margin-top: 24px;
+  text-align: center;
+  font-size: 0.78rem;
+  color: var(--text-muted);
+  font-family: var(--font-mono);
+}
+
 .toast {
   position: fixed;
   right: 20px;
@@ -661,6 +784,9 @@ a:hover {
 
 @media (max-width: 760px) {
   .grid-2 {
+    grid-template-columns: 1fr;
+  }
+  .filter-bar {
     grid-template-columns: 1fr;
   }
   .auth-card {

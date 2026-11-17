@@ -27,32 +27,18 @@
     }
   }
 
-  async function passkeyLogin(reqId) {
-    ensureSupported();
-    const beginResp = await fetch("/api/auth/passkey/login/begin", {
-      method: "POST",
-      headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ req: reqId || "" }),
-    });
-    const beginData = await beginResp.json();
-    if (!beginResp.ok) {
-      throw new Error(beginData.error || "无法发起 Passkey 登录请求");
-    }
-
-    const pk = beginData.options.publicKey;
+  function prepareRequestOptions(pk) {
     pk.challenge = base64urlToBytes(pk.challenge);
     if (Array.isArray(pk.allowCredentials)) {
       pk.allowCredentials = pk.allowCredentials.map(function (item) {
         return Object.assign({}, item, { id: base64urlToBytes(item.id) });
       });
     }
+    return pk;
+  }
 
-    const cred = await navigator.credentials.get({ publicKey: pk });
-    if (!cred) {
-      throw new Error("未获取到 Passkey 凭证");
-    }
-
-    const payload = {
+  function serializeAssertion(cred) {
+    return {
       id: cred.id,
       rawId: bytesToBase64url(cred.rawId),
       type: cred.type,
@@ -66,6 +52,25 @@
           : undefined,
       },
     };
+  }
+
+  async function passkeyLogin(reqId) {
+    ensureSupported();
+    const beginResp = await fetch("/api/auth/passkey/login/begin", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ req: reqId || "" }),
+    });
+    const beginData = await beginResp.json();
+    if (!beginResp.ok) {
+      throw new Error(beginData.error || "无法发起 Passkey 登录请求");
+    }
+
+    const pk = prepareRequestOptions(beginData.options.publicKey);
+    const cred = await navigator.credentials.get({ publicKey: pk });
+    if (!cred) {
+      throw new Error("未获取到 Passkey 凭证");
+    }
 
     const finishUrl =
       "/api/auth/passkey/login/finish?ceremony_id=" +
@@ -78,7 +83,59 @@
         "Content-Type": "application/json",
         "X-Ceremony-ID": beginData.ceremony_id,
       },
-      body: JSON.stringify(payload),
+      body: JSON.stringify(serializeAssertion(cred)),
+    });
+    const finishData = await finishResp.json();
+    if (!finishResp.ok) {
+      throw new Error(finishData.error || "Passkey 验证失败");
+    }
+    return finishData;
+  }
+
+  async function passkeyConditionalLogin(reqId, abortSignal) {
+    if (
+      !window.PublicKeyCredential ||
+      typeof window.PublicKeyCredential.isConditionalMediationAvailable !== "function"
+    ) {
+      return null;
+    }
+    const available = await window.PublicKeyCredential.isConditionalMediationAvailable();
+    if (!available) {
+      return null;
+    }
+
+    const beginResp = await fetch("/api/auth/passkey/login/conditional", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ req: reqId || "" }),
+    });
+    if (!beginResp.ok) {
+      return null;
+    }
+    const beginData = await beginResp.json();
+    const pk = prepareRequestOptions(beginData.options.publicKey);
+
+    const cred = await navigator.credentials.get({
+      publicKey: pk,
+      mediation: "conditional",
+      signal: abortSignal,
+    });
+    if (!cred) {
+      return null;
+    }
+
+    const finishUrl =
+      "/api/auth/passkey/login/finish?ceremony_id=" +
+      encodeURIComponent(beginData.ceremony_id) +
+      (reqId ? "&req=" + encodeURIComponent(reqId) : "");
+
+    const finishResp = await fetch(finishUrl, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-Ceremony-ID": beginData.ceremony_id,
+      },
+      body: JSON.stringify(serializeAssertion(cred)),
     });
     const finishData = await finishResp.json();
     if (!finishResp.ok) {
@@ -89,12 +146,9 @@
 
   async function passkeyRegister(deviceName, csrfToken) {
     ensureSupported();
-    const csrf =
-      csrfToken ||
-      (global.VESPER_CONFIG && global.VESPER_CONFIG.csrfToken) ||
-      "";
     const beginHeaders = { "Content-Type": "application/json" };
-    if (csrf) beginHeaders["X-CSRF-Token"] = csrf;
+    if (csrfToken) beginHeaders["X-CSRF-Token"] = csrfToken;
+
     const beginResp = await fetch("/api/admin/passkeys/register/begin", {
       method: "POST",
       headers: beginHeaders,
@@ -102,7 +156,9 @@
     });
     const beginData = await beginResp.json();
     if (!beginResp.ok) {
-      throw new Error(beginData.error || "无法发起 Passkey 绑定");
+      const err = new Error(beginData.error || "无法发起 Passkey 绑定");
+      err.code = beginData.code;
+      throw err;
     }
 
     const pk = beginData.options.publicKey;
@@ -140,7 +196,8 @@
       "Content-Type": "application/json",
       "X-Ceremony-ID": beginData.ceremony_id,
     };
-    if (csrf) finishHeaders["X-CSRF-Token"] = csrf;
+    if (csrfToken) finishHeaders["X-CSRF-Token"] = csrfToken;
+
     const finishResp = await fetch(
       "/api/admin/passkeys/register/finish?ceremony_id=" +
         encodeURIComponent(beginData.ceremony_id),
@@ -157,8 +214,53 @@
     return finishData;
   }
 
+  async function passkeySudo(csrfToken) {
+    ensureSupported();
+    const headers = { "Content-Type": "application/json" };
+    if (csrfToken) headers["X-CSRF-Token"] = csrfToken;
+
+    const beginResp = await fetch("/api/admin/sudo/passkey/begin", {
+      method: "POST",
+      headers: headers,
+      body: "{}",
+    });
+    const beginData = await beginResp.json();
+    if (!beginResp.ok) {
+      throw new Error(beginData.error || "无法发起 Passkey 二次验证");
+    }
+
+    const pk = prepareRequestOptions(beginData.options.publicKey);
+    const cred = await navigator.credentials.get({ publicKey: pk });
+    if (!cred) {
+      throw new Error("未获取到 Passkey 凭证");
+    }
+
+    const finishHeaders = {
+      "Content-Type": "application/json",
+      "X-Ceremony-ID": beginData.ceremony_id,
+    };
+    if (csrfToken) finishHeaders["X-CSRF-Token"] = csrfToken;
+
+    const finishResp = await fetch(
+      "/api/admin/sudo/passkey/finish?ceremony_id=" +
+        encodeURIComponent(beginData.ceremony_id),
+      {
+        method: "POST",
+        headers: finishHeaders,
+        body: JSON.stringify(serializeAssertion(cred)),
+      }
+    );
+    const finishData = await finishResp.json();
+    if (!finishResp.ok) {
+      throw new Error(finishData.error || "Passkey 二次验证失败");
+    }
+    return finishData;
+  }
+
   global.VesperWebAuthn = {
     login: passkeyLogin,
+    conditionalLogin: passkeyConditionalLogin,
     register: passkeyRegister,
+    sudo: passkeySudo,
   };
 })(window);
